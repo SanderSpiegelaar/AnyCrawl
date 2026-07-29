@@ -227,25 +227,46 @@ export class QueueManager {
         timeout: number = 30000
     ): Promise<any> {
         return new Promise((resolve, reject) => {
+            // Track settlement + the pending poll timer so the polling loop is
+            // always torn down. Otherwise a timed-out or BullMQ-"failed" job leaves
+            // the recursive setTimeout(checkJob, 100) running forever, leaking one
+            // Redis-polling timer per such job until the process is restarted.
+            let settled = false;
+            let pollId: ReturnType<typeof setTimeout> | null = null;
+
+            const cleanup = () => {
+                settled = true;
+                if (pollId) {
+                    clearTimeout(pollId);
+                    pollId = null;
+                }
+                clearTimeout(timeoutId);
+            };
+
             const timeoutId = setTimeout(() => {
+                if (settled) return;
+                cleanup();
                 log.error(`[${queueName}] checkJob: ${jobId} timed out after ${timeout}ms`);
                 reject(new Error(`Job ${jobId} timed out after ${timeout}ms`));
             }, timeout);
 
             const checkJob = async () => {
+                if (settled) return;
                 try {
                     const isJobDone = await QueueManager.getInstance().isJobDone(queueName, jobId);
+                    if (settled) return;
                     if (isJobDone) {
-                        clearTimeout(timeoutId);
+                        cleanup();
                         const data = await QueueManager.getInstance().getJobData(queueName, jobId);
                         log.info(`[${queueName}] checkJob: ${jobId} done`);
                         resolve(data);
                     } else {
                         // Add delay between checks to reduce CPU usage
-                        setTimeout(checkJob, 100); // Check every 100ms
+                        pollId = setTimeout(checkJob, 100); // Check every 100ms
                     }
                 } catch (error) {
-                    clearTimeout(timeoutId);
+                    if (settled) return;
+                    cleanup();
                     log.error(`[${queueName}] checkJob: ${jobId} failed: ${error}`);
                     reject(error);
                 }

@@ -111,6 +111,12 @@ export class Utils {
             this.redisConnection = new IORedis.default(process.env.ANYCRAWL_REDIS_URL!, {
                 maxRetriesPerRequest: null,
             });
+            // Always keep an 'error' listener attached. Without one, ioredis emits
+            // an unhandled 'error' event on connection blips, which surfaces as an
+            // uncaughtException and (via index.ts) tears down the whole process.
+            this.redisConnection.on("error", (err) => {
+                log.error(`[Redis] connection error: ${err instanceof Error ? err.message : String(err)}`);
+            });
         }
         return this.redisConnection;
     }
