@@ -54,6 +54,15 @@ Free trial available. Use code **PROXY90** for an exclusive 10% discount.
 </div>
 AtlasCloud(https://www.atlascloud.ai/?utm_source=github&utm_medium=sponsor&utm_campaign=AnyCrawl) — Atlas Cloud gives developers one API for 300 plus models, covering video, image, and LLM. It includes DeepSeek, GPT, Claude, Flux, Kling, and Seedance.
 
+<div align="center">
+  <p>
+    <a href="https://talordata.com/?campaignid=5avLYJ0mVCaOwWWx&utm_source=GitHub&utm_term=anycrawl">
+      <img src="assets/sponsors/black-talordata.png" alt="TalorData" width="300">
+    </a>
+  </p>
+</div>
+TalorData provides a fast, reliable SERP API that delivers structured, real-time search data from Google, Bing, Yandex, and DuckDuckGo, built for AI agents and SEO automation. Sign up to receive free trial and a 10% discount.
+
 ## 📖 Overview
 
 AnyCrawl is a high‑performance crawling and scraping toolkit:
