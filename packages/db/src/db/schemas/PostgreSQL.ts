@@ -702,3 +702,72 @@ export const templateRevisions = p.pgTable("template_revisions", {
     p.uniqueIndex("uq_template_revision").on(t.templateUuid, t.configHash),
     p.index("ix_template_revision_created").on(t.templateUuid, t.createdAt, t.uuid),
 ]);
+
+// ============================================================================
+// Template Runs (L3 Phase 3) — the unified async run record for every Template
+// execution, legacy or orchestrated (platform §9.2). One row carries owner,
+// the frozen revision + input snapshot, the dataset destination, and the full
+// lifecycle: status advances queued→running→{completed|partial|failed} and
+// cancelling→cancelled (§5); terminal states are immutable. `template_run_events`
+// is the append-only audit feed backing `/events` cursor polling (§11.8).
+//
+// FK notes: `template_uuid` cascades like `template_revisions` (a run is history
+// owned by its template). Association FKs (revision/dataset/dataset_run/legacy
+// job) are plain nullable references. The reserved `dataset_runs.template_run_uuid`
+// and `run_warnings.template_run_uuid` columns stay FK-less to avoid the circular
+// dependency (they are declared above this table).
+//
+// Idempotency: `idempotency_scope_hash` is derived from Owner + Template +
+// original Idempotency-Key (§9.2 rule 2), so owner is already baked into the
+// value. A single partial unique index over (template_uuid, idempotency_scope_hash)
+// WHERE hash IS NOT NULL therefore makes create idempotent without persisting a
+// cross-owner plaintext tuple and without needing two owner-keyed indexes.
+// ============================================================================
+
+export const templateRuns = p.pgTable("template_runs", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    apiKey: p.uuid("api_key_id").references(() => apiKey.uuid),
+    userId: p.uuid("user_id"),
+    templateUuid: p.uuid("template_uuid").notNull().references(() => templates.uuid, { onDelete: "cascade" }),
+    templateRevisionUuid: p.uuid("template_revision_uuid").references(() => templateRevisions.uuid),  // nullable: legacy adapter may run current config
+    mode: p.text("mode").notNull(),                                                                    // single | orchestrated
+    status: p.text("status").notNull(),                                                                // queued | running | partial | completed | failed | cancelling | cancelled
+    idempotencyScopeHash: p.text("idempotency_scope_hash"),
+    inputSnapshot: p.jsonb("input_snapshot").$type<Record<string, unknown>>(),
+    normalizedInputHash: p.text("normalized_input_hash"),
+    runOptions: p.jsonb("run_options").$type<Record<string, unknown>>(),
+    datasetId: p.uuid("dataset_id").references(() => datasets.uuid),
+    datasetRunUuid: p.uuid("dataset_run_uuid").references(() => datasetRuns.uuid),
+    legacyJobUuid: p.uuid("legacy_job_uuid").references(() => jobs.uuid),
+    statistics: p.jsonb("statistics").$type<Record<string, unknown>>(),
+    stopReason: p.text("stop_reason"),
+    errorCode: p.text("error_code"),
+    errorMessage: p.text("error_message"),
+    cancelRequestedAt: p.timestamp("cancel_requested_at", { withTimezone: true }),
+    startedAt: p.timestamp("started_at", { withTimezone: true }),
+    finishedAt: p.timestamp("finished_at", { withTimezone: true }),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+    updatedAt: p.timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.index("ix_template_run_user_created").on(t.userId, t.createdAt, t.uuid),
+    p.index("ix_template_run_apikey_created").on(t.apiKey, t.createdAt, t.uuid),
+    p.index("ix_template_run_template_created").on(t.templateUuid, t.createdAt, t.uuid),
+    p.uniqueIndex("uq_template_run_idempotency")
+        .on(t.templateUuid, t.idempotencyScopeHash)
+        .where(sql`${t.idempotencyScopeHash} IS NOT NULL`),
+    // Explicit FK indexes (§11.9 rule 1); owner/template FKs are covered by the composite lists above.
+    p.index("ix_template_run_revision").on(t.templateRevisionUuid),
+    p.index("ix_template_run_dataset").on(t.datasetId),
+    p.index("ix_template_run_dataset_run").on(t.datasetRunUuid),
+    p.index("ix_template_run_legacy_job").on(t.legacyJobUuid),
+]);
+
+export const templateRunEvents = p.pgTable("template_run_events", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    templateRunUuid: p.uuid("template_run_id").notNull().references(() => templateRuns.uuid, { onDelete: "cascade" }),
+    eventType: p.text("event_type").notNull(),
+    payload: p.jsonb("payload").$type<Record<string, unknown>>(),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.index("ix_template_run_event_cursor").on(t.templateRunUuid, t.createdAt, t.uuid),
+]);

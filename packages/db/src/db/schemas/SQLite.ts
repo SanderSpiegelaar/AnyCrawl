@@ -681,3 +681,58 @@ export const templateRevisions = p.sqliteTable("template_revisions", {
     p.uniqueIndex("uq_template_revision").on(t.templateUuid, t.configHash),
     p.index("ix_template_revision_created").on(t.templateUuid, t.createdAt, t.uuid),
 ]);
+
+// ============================================================================
+// Template Runs (L3 Phase 3) — SQLite parallel of platform §9.2 / §11.8. Type
+// substitutions: uuid->text, jsonb->text{json}, timestamptz->integer{timestamp}.
+// Same table/column/index names and semantics as PostgreSQL. The idempotency
+// unique index is partial (WHERE idempotency_scope_hash IS NOT NULL); the events
+// table is the append-only /events cursor feed cascading from its run.
+// ============================================================================
+
+export const templateRuns = p.sqliteTable("template_runs", {
+    uuid: p.text("uuid").primaryKey().$defaultFn(() => randomUUID()),
+    apiKey: p.text("api_key_id").references(() => apiKey.uuid),
+    userId: p.text("user_id"),
+    templateUuid: p.text("template_uuid").notNull().references(() => templates.uuid, { onDelete: "cascade" }),
+    templateRevisionUuid: p.text("template_revision_uuid").references(() => templateRevisions.uuid),  // nullable: legacy adapter may run current config
+    mode: p.text("mode").notNull(),                                                                    // single | orchestrated
+    status: p.text("status").notNull(),                                                                // queued | running | partial | completed | failed | cancelling | cancelled
+    idempotencyScopeHash: p.text("idempotency_scope_hash"),
+    inputSnapshot: p.text("input_snapshot", { mode: "json" }).$type<Record<string, unknown>>(),
+    normalizedInputHash: p.text("normalized_input_hash"),
+    runOptions: p.text("run_options", { mode: "json" }).$type<Record<string, unknown>>(),
+    datasetId: p.text("dataset_id").references(() => datasets.uuid),
+    datasetRunUuid: p.text("dataset_run_uuid").references(() => datasetRuns.uuid),
+    legacyJobUuid: p.text("legacy_job_uuid").references(() => jobs.uuid),
+    statistics: p.text("statistics", { mode: "json" }).$type<Record<string, unknown>>(),
+    stopReason: p.text("stop_reason"),
+    errorCode: p.text("error_code"),
+    errorMessage: p.text("error_message"),
+    cancelRequestedAt: p.integer("cancel_requested_at", { mode: "timestamp" }),
+    startedAt: p.integer("started_at", { mode: "timestamp" }),
+    finishedAt: p.integer("finished_at", { mode: "timestamp" }),
+    createdAt: p.integer("created_at", { mode: "timestamp" }).notNull(),
+    updatedAt: p.integer("updated_at", { mode: "timestamp" }).notNull(),
+}, (t) => [
+    p.index("ix_template_run_user_created").on(t.userId, t.createdAt, t.uuid),
+    p.index("ix_template_run_apikey_created").on(t.apiKey, t.createdAt, t.uuid),
+    p.index("ix_template_run_template_created").on(t.templateUuid, t.createdAt, t.uuid),
+    p.uniqueIndex("uq_template_run_idempotency")
+        .on(t.templateUuid, t.idempotencyScopeHash)
+        .where(sql`${t.idempotencyScopeHash} IS NOT NULL`),
+    p.index("ix_template_run_revision").on(t.templateRevisionUuid),
+    p.index("ix_template_run_dataset").on(t.datasetId),
+    p.index("ix_template_run_dataset_run").on(t.datasetRunUuid),
+    p.index("ix_template_run_legacy_job").on(t.legacyJobUuid),
+]);
+
+export const templateRunEvents = p.sqliteTable("template_run_events", {
+    uuid: p.text("uuid").primaryKey().$defaultFn(() => randomUUID()),
+    templateRunUuid: p.text("template_run_id").notNull().references(() => templateRuns.uuid, { onDelete: "cascade" }),
+    eventType: p.text("event_type").notNull(),
+    payload: p.text("payload", { mode: "json" }).$type<Record<string, unknown>>(),
+    createdAt: p.integer("created_at", { mode: "timestamp" }).notNull(),
+}, (t) => [
+    p.index("ix_template_run_event_cursor").on(t.templateRunUuid, t.createdAt, t.uuid),
+]);

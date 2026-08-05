@@ -30,6 +30,13 @@ import {
 import { Dataset } from "./model/Dataset.js";
 import { DatasetWriter } from "./model/DatasetWriter.js";
 import { TemplateRevision } from "./model/TemplateRevision.js";
+import { TemplateRun } from "./model/TemplateRun.js";
+import {
+    buildTemplateRunWhereClause as buildTemplateRunWhereClauseByOwner,
+    getOwnedTemplateRun as getOwnedTemplateRunByOwner,
+    listTemplateRunsByOwner as listTemplateRunsByOwnerOwner,
+    resolveTemplateRunOwnerScope as resolveTemplateRunOwnerScopeFn,
+} from "./model/TemplateRunAccess.js";
 
 // Backward compatibility functions
 export const createJob = Job.create;
@@ -62,6 +69,22 @@ export const getTemplateRevision = TemplateRevision.get;
 export const listTemplateRevisions = TemplateRevision.listByTemplate;
 export const freezeCurrentTemplateRevision = TemplateRevision.freezeCurrentAndSetPointer;
 export const computeTemplateConfigHash = TemplateRevision.computeConfigHash;
+
+// Template runs (L3 Phase 3) — unified async run core: create (idempotent),
+// lifecycle transitions, cancel, finalize, and the /events audit feed.
+export const createTemplateRun = TemplateRun.create;
+export const getTemplateRun = TemplateRun.get;
+export const updateTemplateRunStatus = TemplateRun.updateStatus;
+export const requestTemplateRunCancel = TemplateRun.requestCancel;
+export const finalizeTemplateRun = TemplateRun.finalize;
+export const appendTemplateRunEvent = TemplateRun.appendEvent;
+export const listTemplateRunEvents = TemplateRun.listEvents;
+
+// Template run ownership + access helpers
+export const buildTemplateRunWhereClause = buildTemplateRunWhereClauseByOwner;
+export const getOwnedTemplateRun = getOwnedTemplateRunByOwner;
+export const listTemplateRunsByOwner = listTemplateRunsByOwnerOwner;
+export const resolveTemplateRunOwnerScope = resolveTemplateRunOwnerScopeFn;
 
 export const chargeDeltaByJobId = Billing.chargeDeltaByJobId;
 export const chargeToUsedByJobId = Billing.chargeToUsedByJobId;
@@ -129,6 +152,9 @@ export { computeDocumentHash, shallowFieldDiff } from "./model/documentHash.js";
 // Template system exports
 export { templates, templateExecutions, templateRevisions, billingLedger } from "./db/schemas/PostgreSQL.js";
 
+// Template run (L3 Phase 3) table exports
+export { templateRuns, templateRunEvents } from "./db/schemas/PostgreSQL.js";
+
 // Scheduled tasks and webhooks exports
 export {
     scheduledTasks,
@@ -158,9 +184,18 @@ export {
     runWarnings,
 } from "./db/schemas/PostgreSQL.js";
 
-export { eq, and, gt, gte, sql, desc, getDB, schemas, STATUS, JOB_RESULT_STATUS, Job, Billing, Dataset, TemplateRevision };
+export { eq, and, gt, gte, sql, desc, getDB, schemas, STATUS, JOB_RESULT_STATUS, Job, Billing, Dataset, TemplateRevision, TemplateRun };
+export { TEMPLATE_RUN_TERMINAL_STATUSES } from "./model/TemplateRun.js";
 export type { CreateJobParams, CreateTemplateParams };
 export type { FreezeRevisionParams } from "./model/TemplateRevision.js";
+export type {
+    CreateTemplateRunParams,
+    UpdateTemplateRunStatusPatch,
+    FinalizeTemplateRunExtras,
+    TemplateRunMode,
+    TemplateRunStatus,
+    TemplateRunTerminalStatus,
+} from "./model/TemplateRun.js";
 export type {
     FieldType as DatasetFieldType,
     FilterOp as DatasetFilterOp,
