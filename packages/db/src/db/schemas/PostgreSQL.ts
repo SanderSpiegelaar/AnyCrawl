@@ -217,6 +217,11 @@ export const templates = p.pgTable("templates", {
     publishedAt: p.timestamp("published_at"),
     reviewedAt: p.timestamp("reviewed_at"),
     archivedAt: p.timestamp("archived_at"),
+    // [L3] Pointer to the current immutable template_revisions snapshot (§9.1 rule 7).
+    // Deliberately a plain nullable uuid with NO .references(): template_revisions FKs
+    // back to templates.uuid, so a real FK here would create a circular dependency and
+    // an unsatisfiable insert ordering. The pointer is maintained in application code.
+    currentRevisionUuid: p.uuid("current_revision_uuid"),
 });
 
 export const templateExecutions = p.pgTable("template_executions", {
@@ -675,4 +680,25 @@ export const runWarnings = p.pgTable("run_warnings", {
     p.index("ix_run_warnings_dataset_run").on(t.datasetRunId, t.createdAt, t.uuid),
     p.index("ix_run_warnings_template_run").on(t.templateRunUuid, t.createdAt, t.uuid),
     p.index("ix_run_warnings_code").on(t.datasetRunId, t.code),
+]);
+
+// ============================================================================
+// Template Revisions (L3) — immutable template version snapshots (platform §9.1).
+// A revision freezes the full execution config + output schema for a template so
+// historical Runs/Schedules stay reproducible and are unaffected by later edits.
+// UNIQUE(template_uuid, config_hash) makes concurrent get-or-create idempotent
+// (§9.1 rule 6). templates.current_revision_uuid points at the active revision.
+// ============================================================================
+
+export const templateRevisions = p.pgTable("template_revisions", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    templateUuid: p.uuid("template_uuid").notNull().references(() => templates.uuid, { onDelete: "cascade" }),
+    version: p.text("version").notNull(),
+    configHash: p.text("config_hash").notNull(),
+    configSnapshot: p.jsonb("config_snapshot").notNull().$type<Record<string, unknown>>(),
+    schemaSnapshot: p.jsonb("schema_snapshot").$type<Record<string, unknown>>(),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.uniqueIndex("uq_template_revision").on(t.templateUuid, t.configHash),
+    p.index("ix_template_revision_created").on(t.templateUuid, t.createdAt, t.uuid),
 ]);

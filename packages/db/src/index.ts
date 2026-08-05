@@ -29,6 +29,7 @@ import {
 } from "./model/DatasetAccess.js";
 import { Dataset } from "./model/Dataset.js";
 import { DatasetWriter } from "./model/DatasetWriter.js";
+import { TemplateRevision } from "./model/TemplateRevision.js";
 
 // Backward compatibility functions
 export const createJob = Job.create;
@@ -54,6 +55,13 @@ export const updateTemplate = Template.update;
 export const deleteTemplate = Template.delete;
 export const deleteTemplateIfExists = Template.deleteIfExists;
 export const existsTemplate = Template.exists;
+
+// Template revisions (L3) — immutable version snapshots + get-or-create freeze.
+export const createTemplateRevision = TemplateRevision.freeze;
+export const getTemplateRevision = TemplateRevision.get;
+export const listTemplateRevisions = TemplateRevision.listByTemplate;
+export const freezeCurrentTemplateRevision = TemplateRevision.freezeCurrentAndSetPointer;
+export const computeTemplateConfigHash = TemplateRevision.computeConfigHash;
 
 export const chargeDeltaByJobId = Billing.chargeDeltaByJobId;
 export const chargeToUsedByJobId = Billing.chargeToUsedByJobId;
@@ -119,7 +127,7 @@ export type {
 export { computeDocumentHash, shallowFieldDiff } from "./model/documentHash.js";
 
 // Template system exports
-export { templates, templateExecutions, billingLedger } from "./db/schemas/PostgreSQL.js";
+export { templates, templateExecutions, templateRevisions, billingLedger } from "./db/schemas/PostgreSQL.js";
 
 // Scheduled tasks and webhooks exports
 export {
@@ -150,8 +158,9 @@ export {
     runWarnings,
 } from "./db/schemas/PostgreSQL.js";
 
-export { eq, and, gt, gte, sql, desc, getDB, schemas, STATUS, JOB_RESULT_STATUS, Job, Billing, Dataset };
+export { eq, and, gt, gte, sql, desc, getDB, schemas, STATUS, JOB_RESULT_STATUS, Job, Billing, Dataset, TemplateRevision };
 export type { CreateJobParams, CreateTemplateParams };
+export type { FreezeRevisionParams } from "./model/TemplateRevision.js";
 export type {
     FieldType as DatasetFieldType,
     FilterOp as DatasetFilterOp,

@@ -306,6 +306,8 @@ export class Template {
             uuid: row.uuid,
             templateId: row.templateId,
             slug: row.slug ?? null,
+            // L3: current immutable revision pointer (db column current_revision_uuid).
+            currentRevisionId: (row as any).currentRevisionUuid ?? null,
             name: row.name,
             description: row.description,
             tags: row.tags || [],

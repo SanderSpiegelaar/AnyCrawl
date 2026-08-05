@@ -30,6 +30,11 @@
             "import": "./dist/types/template-config.js",
             "default": "./dist/types/template-config.js"
         },
+        "./template/validate-contract": {
+            "types": "./dist/template/validate-contract.d.ts",
+            "import": "./dist/template/validate-contract.js",
+            "default": "./dist/template/validate-contract.js"
+        },
         "./types/BaseSchema": {
             "import": "./dist/types/BaseSchema.js",
             "default": "./dist/types/BaseSchema.js"

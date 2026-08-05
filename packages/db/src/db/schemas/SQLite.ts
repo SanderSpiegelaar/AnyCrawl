@@ -217,6 +217,10 @@ export const templates = p.sqliteTable("templates", {
     publishedAt: p.integer("published_at", { mode: "timestamp" }),
     reviewedAt: p.integer("reviewed_at", { mode: "timestamp" }),
     archivedAt: p.integer("archived_at", { mode: "timestamp" }),
+    // [L3] Pointer to the current template_revisions snapshot (§9.1 rule 7). Plain
+    // nullable uuid text column with NO .references() to avoid a circular FK with
+    // template_revisions (which FKs back to templates.uuid); see PostgreSQL note.
+    currentRevisionUuid: p.text("current_revision_uuid"),
 });
 
 export const templateExecutions = p.sqliteTable("template_executions", {
@@ -657,4 +661,23 @@ export const runWarnings = p.sqliteTable("run_warnings", {
     p.index("ix_run_warnings_dataset_run").on(t.datasetRunId, t.createdAt, t.uuid),
     p.index("ix_run_warnings_template_run").on(t.templateRunUuid, t.createdAt, t.uuid),
     p.index("ix_run_warnings_code").on(t.datasetRunId, t.code),
+]);
+
+// ============================================================================
+// Template Revisions (L3) — SQLite parallel of platform §9.1. Type substitutions:
+// uuid->text, jsonb->text{json}, timestamp->integer{timestamp}. Same table/column/
+// index names as PostgreSQL. UNIQUE(template_uuid, config_hash) => idempotent freeze.
+// ============================================================================
+
+export const templateRevisions = p.sqliteTable("template_revisions", {
+    uuid: p.text("uuid").primaryKey().$defaultFn(() => randomUUID()),
+    templateUuid: p.text("template_uuid").notNull().references(() => templates.uuid, { onDelete: "cascade" }),
+    version: p.text("version").notNull(),
+    configHash: p.text("config_hash").notNull(),
+    configSnapshot: p.text("config_snapshot", { mode: "json" }).notNull().$type<Record<string, unknown>>(),
+    schemaSnapshot: p.text("schema_snapshot", { mode: "json" }).$type<Record<string, unknown>>(),
+    createdAt: p.integer("created_at", { mode: "timestamp" }).notNull(),
+}, (t) => [
+    p.uniqueIndex("uq_template_revision").on(t.templateUuid, t.configHash),
+    p.index("ix_template_revision_created").on(t.templateUuid, t.createdAt, t.uuid),
 ]);
