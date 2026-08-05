@@ -184,6 +184,50 @@ try {
 - Polling states: waits until `completed`; throws on `failed`; returns partial data when `cancelled`.
 - Use `getCrawlStatus`/`getCrawlResults` if you prefer manual pagination/progress.
 
+### createBatchScrape(input), getBatchScrapeStatus(jobId), getBatchScrapeResults(jobId, skip?), cancelBatchScrape(jobId)
+
+Scrape many known URLs in one asynchronous job using a single shared set of scrape options (no link discovery). Credits are charged per successfully scraped URL; failed URLs are not charged.
+
+```ts
+const job = await client.createBatchScrape({
+    urls: ["https://example.com/a", "https://example.com/b"],
+    engine: "auto", // optional — same scrape options as scrape()
+    formats: ["markdown"],
+    // Or use a scrape template applied to every URL:
+    // template_id: "tpl_product_page",
+    // variables: { currency: "USD" },
+    ignore_invalid_urls: true,
+});
+
+const status = await client.getBatchScrapeStatus(job.job_id);
+const page = await client.getBatchScrapeResults(job.job_id, 0);
+// await client.cancelBatchScrape(job.job_id);
+```
+
+### batchScrape(input, pollIntervalSeconds = 2, timeoutMs?)
+
+Convenience wrapper that creates a batch scrape, polls status until it completes, and returns aggregated results of all URLs. Throws on failed jobs or timeout; returns partial aggregated data when cancelled.
+
+```ts
+// Type signature
+async function batchScrape(
+    input: BatchScrapeRequest,
+    pollIntervalSeconds?: number, // default 2s
+    timeoutMs?: number // optional
+): Promise<BatchScrapeAndWaitResult>;
+
+// Example
+const result = await client.batchScrape({
+    urls: ["https://example.com/a", "https://example.com/b"],
+    formats: ["markdown"],
+});
+console.log(result.completed, result.failed, result.data.length);
+```
+
+- Returns: `BatchScrapeAndWaitResult` with `job_id`, `status`, `total`, `completed`, `failed`, `creditsUsed`, and aggregated `data` (each item carries its own `url`).
+- Polling states: waits until `completed`; throws on `failed`; returns partial data when `cancelled`.
+- Use `getBatchScrapeStatus`/`getBatchScrapeResults` if you prefer manual pagination/progress.
+
 ### search(input)
 
 ```ts

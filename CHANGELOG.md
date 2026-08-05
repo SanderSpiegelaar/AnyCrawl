@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-beta.35] - 2026-08-06
+
+### Added
+
+- **Batch Scrape API** — new asynchronous endpoint to scrape many known URLs in one job with a single shared set of scrape options (`POST /v1/batch/scrape`, `GET /v1/batch/scrape/:jobId/status`, `GET /v1/batch/scrape/:jobId`, `DELETE /v1/batch/scrape/:jobId`). Response shapes are separate from single `POST /v1/scrape`.
+  - Per-URL billing: credits charged **per successfully scraped URL**; failed URLs are not charged; pre-flight `402` when the account lacks estimated credits.
+  - Scrape template support: `template_id` + `variables` applied to every URL, with per-URL transforms, variable mapping/defaults, and domain restrictions enforced.
+  - Webhook events: `batch_scrape.created`, `batch_scrape.started`, `batch_scrape.page`, `batch_scrape.completed`, `batch_scrape.failed`, `batch_scrape.cancelled`.
+  - Configurable via `ANYCRAWL_BATCH_SCRAPE_MAX_URLS` (default 10000), `ANYCRAWL_BATCH_SCRAPE_CONCURRENCY` (default 10), `ANYCRAWL_BATCH_SCRAPE_WAIT_BUFFER_MS` (default 60000).
+- JS SDK batch scrape methods: `batchScrape()` (create + poll + aggregate), `createBatchScrape()`, `getBatchScrapeStatus()`, `getBatchScrapeResults()`, `cancelBatchScrape()` (published in `@anycrawl/js-sdk` 0.0.7).
+
+### Fixed
+
+- QueueManager: harden Redis error handling and clean up job polling to avoid leaked listeners/timers.
+
 ## [1.0.0-beta.34] - 2026-07-18
 
 ### Fixed
