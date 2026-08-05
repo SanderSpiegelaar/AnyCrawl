@@ -413,6 +413,7 @@ export class Dataset {
             datasetRunId?: string;
             scopeKey?: string;
             itemKey?: string;
+            changeType?: string;
             since?: Date;
             until?: Date;
         }
@@ -421,6 +422,7 @@ export class Dataset {
         if (opts.datasetRunId) conditions.push(eq(schemas.datasetItemChanges.datasetRunId, opts.datasetRunId));
         if (opts.scopeKey) conditions.push(eq(schemas.datasetItemChanges.scopeKey, opts.scopeKey));
         if (opts.itemKey) conditions.push(eq(schemas.datasetItemChanges.itemKey, opts.itemKey));
+        if (opts.changeType) conditions.push(eq(schemas.datasetItemChanges.changeType, opts.changeType));
         if (opts.since) conditions.push(gte(schemas.datasetItemChanges.createdAt, opts.since));
         if (opts.until) conditions.push(lte(schemas.datasetItemChanges.createdAt, opts.until));
         if (opts.cursor) {

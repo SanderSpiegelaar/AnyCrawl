@@ -34,7 +34,8 @@ const createDatasetSchema = z.object({
         name: z.string().min(1),
         version: z.string().min(1),
     }),
-    retention: z
+    // Field name matches the GET response (`retention_policy`) so create/read/update are symmetric.
+    retention_policy: z
         .object({
             item_days: z.number().int().positive().optional(),
             change_days: z.number().int().positive().optional(),
@@ -45,7 +46,7 @@ const createDatasetSchema = z.object({
 const updateDatasetSchema = z.object({
     name: z.string().min(1).optional(),
     description: z.string().nullable().optional(),
-    retention: z
+    retention_policy: z
         .object({
             item_days: z.number().int().positive().optional(),
             change_days: z.number().int().positive().optional(),
@@ -77,7 +78,7 @@ export class DatasetController {
                 description: data.description,
                 schemaName: data.schema.name,
                 schemaVersion: data.schema.version,
-                retentionPolicy: data.retention ?? null,
+                retentionPolicy: data.retention_policy ?? null,
                 sourceType: "manual",
             });
 
@@ -135,7 +136,7 @@ export class DatasetController {
             const updated = await updateDataset(db, req.params.id!, {
                 name: data.name,
                 description: data.description,
-                retentionPolicy: data.retention,
+                retentionPolicy: data.retention_policy,
             });
             res.json({ success: true, data: serializeRecord(updated) });
         } catch (error) {
@@ -355,6 +356,7 @@ export class DatasetController {
                 datasetRunId: this.strParam(req.query.dataset_run_id),
                 scopeKey: this.strParam(req.query.scope_key),
                 itemKey: this.strParam(req.query.item_key),
+                changeType: this.strParam(req.query.change_type),
                 since: since ?? undefined,
                 until: until ?? undefined,
             });
