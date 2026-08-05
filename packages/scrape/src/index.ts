@@ -41,5 +41,6 @@ export * from "./managers/Cache.js";
 // Auto engine utilities
 export { resolveAutoEngine, analyzeHtmlForJSRequirement } from "./utils/autoEngine.js";
 export { runAutoCrawl } from "./utils/crawlCoordinator.js";
+export { runBatchScrape } from "./utils/batchScrapeCoordinator.js";
 export { DomainCache } from "./utils/DomainCache.js";
 export { smartWaitForDOMStable } from "./utils/smartWait.js";

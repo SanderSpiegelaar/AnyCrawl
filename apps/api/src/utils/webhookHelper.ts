@@ -11,7 +11,7 @@ export async function triggerWebhookEvent(
     eventType: WebhookEventType,
     jobId: string,
     payload: Record<string, unknown>,
-    resourceType: "scrape" | "crawl" | "search" | "task" | "map"
+    resourceType: "scrape" | "crawl" | "search" | "task" | "map" | "batch_scrape"
 ): Promise<void> {
     if (!config.webhooks.enabled) {
         return;

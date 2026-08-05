@@ -6,6 +6,7 @@ import { getDB, schemas, eq } from "@anycrawl/db";
 // Routes that require credit check (billing endpoints)
 const CREDIT_CHECK_ROUTES = [
     { method: "POST", path: "/v1/scrape" },
+    { method: "POST", path: "/v1/batch/scrape" },
     { method: "POST", path: "/v1/crawl" },
     { method: "POST", path: "/v1/map" },
     { method: "POST", path: "/v1/search" },

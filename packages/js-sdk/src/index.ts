@@ -11,6 +11,11 @@ import {
     CrawlRequest,
     SearchRequest,
     CrawlAndWaitResult,
+    BatchScrapeRequest,
+    BatchScrapeJobResponse,
+    BatchScrapeStatusResponse,
+    BatchScrapeResultsResponse,
+    BatchScrapeAndWaitResult,
     MapRequest,
     MapResult,
     CreateScheduledTaskRequest,
@@ -39,6 +44,12 @@ import {
     getCrawlResults as getCrawlResultsMethod,
     crawlAndWait as crawlAndWaitMethod,
 } from './methods/crawl.js';
+import {
+    createBatchScrape as createBatchScrapeMethod,
+    getBatchScrapeStatus as getBatchScrapeStatusMethod,
+    getBatchScrapeResults as getBatchScrapeResultsMethod,
+    batchScrapeAndWait as batchScrapeAndWaitMethod,
+} from './methods/batch-scrape.js';
 import { search as searchMethod } from './methods/search.js';
 import { map as mapMethod } from './methods/map.js';
 import * as scheduledTasksMethods from './methods/scheduled-tasks.js';
@@ -184,6 +195,53 @@ export class AnyCrawlClient {
     async cancelCrawl(jobId: string): Promise<{ job_id: string; status: string }> {
         const response: AxiosResponse<unknown> = await this.client.delete(`/v1/crawl/${jobId}`);
         return unwrapApiResponse<{ job_id: string; status: string }>(response.data, 'Failed to cancel crawl');
+    }
+
+    /**
+     * Create a batch scrape job (async). Options are shared across all URLs.
+     *
+     * @param input Batch scrape parameters (urls + shared scrape options)
+     * @returns Batch scrape job metadata (job_id, status, total, invalid_urls)
+     */
+    async createBatchScrape(input: BatchScrapeRequest): Promise<BatchScrapeJobResponse> {
+        return await createBatchScrapeMethod(this.client, input);
+    }
+
+    /**
+     * Get the current status of a batch scrape job.
+     */
+    async getBatchScrapeStatus(jobId: string): Promise<BatchScrapeStatusResponse> {
+        return await getBatchScrapeStatusMethod(this.client, jobId);
+    }
+
+    /**
+     * Get a page of batch scrape results.
+     */
+    async getBatchScrapeResults(jobId: string, skip: number = 0): Promise<BatchScrapeResultsResponse> {
+        return await getBatchScrapeResultsMethod(this.client, jobId, skip);
+    }
+
+    /**
+     * Cancel a running batch scrape.
+     */
+    async cancelBatchScrape(jobId: string): Promise<{ job_id: string; status: string }> {
+        const response: AxiosResponse<unknown> = await this.client.delete(`/v1/batch/scrape/${jobId}`);
+        return unwrapApiResponse<{ job_id: string; status: string }>(response.data, 'Failed to cancel batch scrape');
+    }
+
+    /**
+     * Create a batch scrape and block until it finishes, then return aggregated results.
+     *
+     * @param input Batch scrape parameters (urls + shared scrape options)
+     * @param pollIntervalSeconds Poll interval in seconds (default: 2s)
+     * @param timeoutMs Optional timeout in milliseconds (no timeout if undefined)
+     */
+    async batchScrape(
+        input: BatchScrapeRequest,
+        pollIntervalSeconds: number = 2,
+        timeoutMs?: number
+    ): Promise<BatchScrapeAndWaitResult> {
+        return await batchScrapeAndWaitMethod(this.client, input, pollIntervalSeconds, timeoutMs);
     }
 
     /**

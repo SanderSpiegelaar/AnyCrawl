@@ -1,5 +1,6 @@
 import express, { Router, ErrorRequestHandler } from "express";
 import { ScrapeController } from "../../controllers/v1/ScrapeController.js";
+import { BatchScrapeController } from "../../controllers/v1/BatchScrapeController.js";
 import { SearchController } from "../../controllers/v1/SearchController.js";
 import { CrawlController } from "../../controllers/v1/CrawlController.js";
 import { MapController } from "../../controllers/v1/MapController.js";
@@ -10,6 +11,7 @@ import { controllerWrapper } from "../../utils/AsyncHandler.js";
 
 const router: express.Router = Router();
 const scrapeController = new ScrapeController();
+const batchScrapeController = new BatchScrapeController();
 const searchController = new SearchController();
 const crawlController = new CrawlController();
 const mapController = new MapController();
@@ -20,6 +22,12 @@ const monitorController = new MonitorController();
 router.post("/scrape", controllerWrapper(scrapeController.handle));
 router.post("/search", controllerWrapper(searchController.handle));
 router.post("/map", controllerWrapper(mapController.map));
+
+// Batch scrape routes (async job model)
+router.post("/batch/scrape", controllerWrapper(batchScrapeController.start));
+router.get("/batch/scrape/:jobId/status", controllerWrapper(batchScrapeController.status));
+router.get("/batch/scrape/:jobId", controllerWrapper(batchScrapeController.results));
+router.delete("/batch/scrape/:jobId", controllerWrapper(batchScrapeController.cancel));
 
 // Crawl routes
 router.post("/crawl", controllerWrapper(crawlController.start));

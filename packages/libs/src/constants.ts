@@ -40,5 +40,6 @@ export const EXTRACT_SOURCES = [
 export const JOB_TYPE_SCRAPE = 'scrape' as const;
 export const JOB_TYPE_CRAWL = 'crawl' as const;
 export const JOB_TYPE_MAP = 'map' as const;
+export const JOB_TYPE_BATCH_SCRAPE = 'batch_scrape' as const;
 
 export const AVAILABLE_SEARCH_ENGINES = ["google", "searxng", 'ac-engine'] as const;

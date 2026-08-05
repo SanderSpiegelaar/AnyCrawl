@@ -22,6 +22,7 @@ export class Job {
     // Job type to expiration duration (ms)
     private static readonly JOB_TYPE_EXPIRE_MAP: Record<string, number> = {
         crawl: 3 * 60 * 60 * 1000, // 3 hours
+        batch_scrape: 3 * 60 * 60 * 1000, // 3 hours
         scrape: 1 * 60 * 60 * 1000, // 1 hour
         // add more types as needed
     };

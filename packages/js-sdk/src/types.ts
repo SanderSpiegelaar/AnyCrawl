@@ -209,6 +209,58 @@ export type CrawlAndWaitResult = {
     data: any[];
 };
 
+// Batch scrape types (async job model; options are shared across all URLs)
+export type BatchScrapeRequest = {
+    urls: string[];
+    engine?: Engine;
+    /** When true (default), invalid URLs are skipped and returned in invalid_urls */
+    ignore_invalid_urls?: boolean;
+    /** Template ID to use (merges with template defaults) */
+    template_id?: string;
+    /** Template variables for URL/option substitution */
+    variables?: Record<string, any>;
+} & ScrapeOptionsInput;
+
+export type BatchScrapeJobResponse = {
+    job_id: string;
+    status: 'created';
+    total: number;
+    invalid_urls?: string[];
+    message: string;
+};
+
+export type BatchScrapeStatus = CrawlStatus;
+export type BatchScrapeStatusResponse = {
+    job_id: string;
+    status: BatchScrapeStatus;
+    total: number;
+    completed: number;
+    failed: number;
+    credits_used: number;
+    expires_at?: string;
+};
+
+export type BatchScrapeResultsResponse = {
+    success: true;
+    status: BatchScrapeStatus;
+    total: number;
+    completed: number;
+    failed?: number;
+    creditsUsed: number;
+    next?: string | null;
+    data: any[];
+};
+
+export type BatchScrapeAndWaitResult = {
+    job_id: string;
+    status: BatchScrapeStatus;
+    total: number;
+    completed: number;
+    failed: number;
+    creditsUsed: number;
+    data: any[];
+};
+
 // Map types
 export type MapLink = {
     url: string;

@@ -226,6 +226,41 @@ curl -X POST https://api.anycrawl.dev/v1/crawl \
 
 More parameters and endpoints: see [Request Parameters](https://docs.anycrawl.dev/en/general/scrape#request-parameters).
 
+### Batch Scrape
+
+Scrape many known URLs in a single asynchronous job, all sharing the same scrape options. Create a job, then poll status and pull paginated results (like Crawl, but with a fixed URL set and no link discovery).
+
+#### Example
+
+```typescript
+
+curl -X POST https://api.anycrawl.dev/v1/batch/scrape \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_ANYCRAWL_API_KEY' \
+  -d '{
+  "urls": ["https://example.com/a", "https://example.com/b"],
+  "engine": "cheerio",
+  "formats": ["markdown"]
+}'
+# -> { "success": true, "data": { "job_id": "...", "status": "created", "total": 2 } }
+
+# Poll status / fetch results
+curl -H 'Authorization: Bearer YOUR_ANYCRAWL_API_KEY' https://api.anycrawl.dev/v1/batch/scrape/JOB_ID/status
+curl -H 'Authorization: Bearer YOUR_ANYCRAWL_API_KEY' https://api.anycrawl.dev/v1/batch/scrape/JOB_ID
+
+```
+
+#### Parameters
+
+| Parameter           | Type                | Description                                                             | Default |
+| ------------------- | ------------------- | ---------------------------------------------------------------------- | ------- |
+| urls                | array<string> (req) | URLs to scrape (de-duplicated; up to `ANYCRAWL_BATCH_SCRAPE_MAX_URLS`) | -       |
+| engine              | string              | Scrape engine: `auto`, `cheerio`, `playwright`, `puppeteer`            | auto    |
+| ignore_invalid_urls | boolean             | Skip malformed URLs (returned in `invalid_urls`) instead of erroring   | true    |
+| _scrape options_    | -                   | All single-scrape options (`formats`, `proxy`, `json_options`, ...) shared across every URL | -       |
+
+Credits are charged per successfully scraped URL (failed URLs are not charged). Full reference: [Batch Scrape API](./docs/api/batch-scrape.md).
+
 ### Search Engine Results (SERP)
 
 #### Example

@@ -11,7 +11,7 @@ import { CrawlerErrorType } from "@anycrawl/scrape";
 export function validateTemplateOnlyFields(
     requestData: Record<string, any>,
     res: Response,
-    templateType: "scrape" | "crawl" | "search"
+    templateType: "scrape" | "crawl" | "search" | "batch"
 ): boolean {
     if (!requestData.template_id) {
         return true; // No validation needed if not using template
@@ -21,7 +21,8 @@ export function validateTemplateOnlyFields(
     const allowedFieldsMap: Record<typeof templateType, Set<string>> = {
         scrape: new Set(['template_id', 'url', 'variables']),
         crawl: new Set(['template_id', 'url', 'variables']),
-        search: new Set(['template_id', 'query', 'variables'])
+        search: new Set(['template_id', 'query', 'variables']),
+        batch: new Set(['template_id', 'urls', 'variables', 'ignore_invalid_urls'])
     };
 
     const allowedKeys = allowedFieldsMap[templateType];

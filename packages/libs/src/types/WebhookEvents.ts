@@ -18,6 +18,14 @@ export enum WebhookEventType {
     CRAWL_FAILED = "crawl.failed",
     CRAWL_CANCELLED = "crawl.cancelled",
 
+    // Batch scrape job events
+    BATCH_SCRAPE_CREATED = "batch_scrape.created",
+    BATCH_SCRAPE_STARTED = "batch_scrape.started",
+    BATCH_SCRAPE_PAGE = "batch_scrape.page",
+    BATCH_SCRAPE_COMPLETED = "batch_scrape.completed",
+    BATCH_SCRAPE_FAILED = "batch_scrape.failed",
+    BATCH_SCRAPE_CANCELLED = "batch_scrape.cancelled",
+
     // Search job events
     SEARCH_CREATED = "search.created",
     SEARCH_STARTED = "search.started",

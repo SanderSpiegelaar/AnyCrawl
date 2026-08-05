@@ -385,6 +385,19 @@ export function estimateTaskCredits(
             return templateCredits + pages + scrapeCredits + scrapeFollowTemplateCredits;
         }
 
+        if (actualTaskType === "batch_scrape") {
+            const urls = Array.isArray(actualPayload.urls) ? actualPayload.urls : [];
+            const count = urls.length || Number(actualPayload.limit) || 0;
+            const scrapeOptions = actualPayload.options || actualPayload;
+            const perUrlCredits = CreditCalculator.calculateScrapeCredits({
+                proxy: scrapeOptions.proxy,
+                json_options: scrapeOptions.json_options,
+                formats: scrapeOptions.formats,
+                extract_source: scrapeOptions.extract_source,
+            });
+            return templateCredits + (perUrlCredits * count);
+        }
+
         if (actualTaskType === "crawl") {
             const limit = actualPayload.limit || actualPayload.options?.limit || 10;
             const scrapeOptions = actualPayload.options?.scrape_options || actualPayload.scrape_options || {};
