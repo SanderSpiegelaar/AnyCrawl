@@ -35,6 +35,9 @@ import {
     MonitorCreateResponse,
     MonitorSnapshot,
     MonitorChange,
+    TemplateExecuteRequest,
+    TemplateExecuteResult,
+    TemplateSpec,
 } from './types.js';
 import { scrape as scrapeMethod } from './methods/scrape.js';
 import { unwrapApiResponse } from './utils/index.js';
@@ -55,6 +58,10 @@ import { map as mapMethod } from './methods/map.js';
 import * as scheduledTasksMethods from './methods/scheduled-tasks.js';
 import * as webhooksMethods from './methods/webhooks.js';
 import * as monitorsMethods from './methods/monitors.js';
+import {
+    executeTemplate as executeTemplateMethod,
+    getTemplateSpec as getTemplateSpecMethod,
+} from './methods/template.js';
 
 /**
  * AnyCrawl JavaScript/TypeScript client.
@@ -262,6 +269,33 @@ export class AnyCrawlClient {
      */
     async map(input: MapRequest): Promise<MapResult> {
         return await mapMethod(this.client, input);
+    }
+
+    /**
+     * Access a template's dedicated endpoint by its vanity slug or templateId.
+     *
+     * Returns a small handle bound to `ref` with two methods:
+     * - `execute(input?)` — POST /v1/template/{ref}/execute. Body accepts only
+     *   `url`/`query`/`variables`. Result depends on the template type: scrape ->
+     *   ScrapeResult, search -> SearchResult[], crawl -> CrawlJobResponse (async).
+     * - `spec()` — GET /v1/template/{ref}. Returns the redacted call-spec (free).
+     *
+     * @param ref Vanity slug (preferred) or templateId
+     *
+     * @example
+     * const t = client.template("content-extractor");
+     * const spec = await t.spec();
+     * const result = await t.execute({ url: "https://example.com" });
+     */
+    template(ref: string): {
+        execute: (input?: TemplateExecuteRequest) => Promise<TemplateExecuteResult>;
+        spec: () => Promise<TemplateSpec>;
+    } {
+        return {
+            execute: (input: TemplateExecuteRequest = {}) =>
+                executeTemplateMethod(this.client, ref, input),
+            spec: () => getTemplateSpecMethod(this.client, ref),
+        };
     }
 
     // Scheduled Tasks

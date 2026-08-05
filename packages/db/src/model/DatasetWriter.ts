@@ -80,6 +80,12 @@ export interface WriteResultToDatasetParams {
      * while pages accumulate.
      */
     finalizeRun?: boolean;
+    /**
+     * 0-based page counter for the occurrence ordering on dataset_run_items. Crawl
+     * per-page writes may supply an increasing index so pages sort deterministically;
+     * one-shot producers (scrape/search) omit it and it defaults to 0.
+     */
+    pageIndex?: number;
 }
 
 export interface RunWarning {
@@ -155,6 +161,17 @@ interface MappedResult {
 }
 
 type ItemClassification = "created" | "updated" | "unchanged" | "replayed" | "skipped";
+
+/**
+ * Result of a per-item upsert: how it was classified plus the uuid of the
+ * dataset_items row it resolved to (null only when the item was skipped and no
+ * row exists, e.g. an oversized document). The uuid is used to link the item
+ * into dataset_run_items for per-run membership.
+ */
+interface UpsertOutcome {
+    classification: ItemClassification;
+    itemUuid: string | null;
+}
 
 export class DatasetWriter {
     // --- Static config helpers ----------------------------------------------
@@ -267,9 +284,15 @@ export class DatasetWriter {
             let unchanged = 0;
             let skipped = 0;
 
+            // 0-based index of the item within this write batch, recorded as the
+            // run_item `position` for occurrence ordering. Incremented for every
+            // candidate considered (including skipped ones) so it tracks arrival order.
+            let position = 0;
+            const pageIndex = Number.isInteger(params.pageIndex) ? (params.pageIndex as number) : 0;
+
             for (const candidate of mapped.candidates) {
                 try {
-                    const classification = await this.upsertItem(
+                    const { classification, itemUuid } = await this.upsertItem(
                         tx,
                         dataset,
                         run,
@@ -283,6 +306,19 @@ export class DatasetWriter {
                     else if (classification === "unchanged") unchanged++;
                     else if (classification === "skipped") skipped++;
                     // "replayed" → duplicate message, counted by neither branch.
+
+                    // Record run membership for every item that resolved to a row
+                    // (created/updated/unchanged/replayed alike — membership is
+                    // independent of change). Skipped items have no row to link.
+                    // onConflictDoNothing makes producer retries / duplicate pages
+                    // side-effect-free on replay.
+                    if (itemUuid) {
+                        await this.insertRunItem(tx, run, itemUuid, candidate.itemKey, {
+                            seedIndex: 0,
+                            pageIndex,
+                            position,
+                        }, now);
+                    }
                 } catch (itemError) {
                     // Isolate a single bad item: record a warning, keep the run partial.
                     skipped++;
@@ -293,6 +329,8 @@ export class DatasetWriter {
                         url: candidate.sourceUrl ?? undefined,
                         message: itemError instanceof Error ? itemError.message : String(itemError),
                     });
+                } finally {
+                    position++;
                 }
             }
 
@@ -339,6 +377,15 @@ export class DatasetWriter {
                 .update(schemas.datasetRuns)
                 .set(runUpdate)
                 .where(eq(schemas.datasetRuns.uuid, run.uuid));
+
+            // Step 6 — at finalize (scrape/search), assign a contiguous sequence
+            // 1..N across this run's members. Non-finalized runs (crawl,
+            // finalizeRun:false) keep sequence NULL and accumulate members per page;
+            // a future crawl-finalize hook will assign sequence at the run's
+            // terminal state. Guarded to be idempotent on replay.
+            if (finalizeRun) {
+                await this.assignRunItemSequences(tx, run.uuid);
+            }
 
             return {
                 datasetId: dataset.uuid,
@@ -522,7 +569,7 @@ export class DatasetWriter {
         params: WriteResultToDatasetParams,
         now: Date,
         warnings: RunWarning[]
-    ): Promise<ItemClassification> {
+    ): Promise<UpsertOutcome> {
         const document = candidate.document;
 
         // Size guard — skip oversized normalized documents, never truncate.
@@ -535,7 +582,7 @@ export class DatasetWriter {
                 url: candidate.sourceUrl ?? undefined,
                 message: `Normalized document ${byteLength} bytes exceeds ${MAX_ITEM_BYTES}`,
             });
-            return "skipped";
+            return { classification: "skipped", itemUuid: null };
         }
 
         const excludePaths = [
@@ -589,7 +636,10 @@ export class DatasetWriter {
                     now,
                 });
                 await this.writeProjections(tx, dataset.uuid, candidate, params, now);
-                return changeInserted ? "created" : "replayed";
+                return {
+                    classification: changeInserted ? "created" : "replayed",
+                    itemUuid: insertedItem.uuid,
+                };
             }
 
             // Lost an insert race — fall through to the update path with the row now present.
@@ -618,7 +668,7 @@ export class DatasetWriter {
         params: WriteResultToDatasetParams,
         now: Date,
         newHash: string
-    ): Promise<ItemClassification> {
+    ): Promise<UpsertOutcome> {
         if (existing.documentHash === newHash) {
             // Unchanged: bump last_seen_at only, no change record (§12 rule 5).
             await tx
@@ -629,7 +679,10 @@ export class DatasetWriter {
             // Replay guard: if this run already logged a change for this item, the
             // message is a duplicate — do not double-count it as "unchanged".
             const alreadyTouched = await this.runHasChangeForItem(tx, run.uuid, candidate.itemKey);
-            return alreadyTouched ? "replayed" : "unchanged";
+            return {
+                classification: alreadyTouched ? "replayed" : "unchanged",
+                itemUuid: existing.uuid,
+            };
         }
 
         // Changed: replace document + hash, record an "updated" change.
@@ -658,7 +711,10 @@ export class DatasetWriter {
             now,
         });
         await this.writeProjections(tx, dataset.uuid, candidate, params, now);
-        return changeInserted ? "updated" : "replayed";
+        return {
+            classification: changeInserted ? "updated" : "replayed",
+            itemUuid: existing.uuid,
+        };
     }
 
     /** Insert a change row idempotently. Returns true iff a new row was written. */
@@ -717,6 +773,89 @@ export class DatasetWriter {
             )
             .limit(1);
         return !!row;
+    }
+
+    // --- Step 5: run membership (dataset_run_items) -------------------------
+
+    /**
+     * Link an item into the run's membership set. `sequence` is left NULL here and
+     * assigned only when the run is finalized (see assignRunItemSequences). The
+     * onConflictDoNothing on (dataset_run_id, item_key) makes this a no-op on
+     * producer retries and duplicate pages, so replays never double-insert.
+     */
+    private static async insertRunItem(
+        tx: DBExecutor,
+        run: any,
+        itemUuid: string,
+        itemKey: string,
+        occurrence: { seedIndex: number; pageIndex: number; position: number },
+        now: Date
+    ): Promise<void> {
+        await tx
+            .insert(schemas.datasetRunItems)
+            .values({
+                datasetRunId: run.uuid,
+                datasetItemId: itemUuid,
+                itemKey,
+                sequence: null,
+                // Standard producers have no per-seed fan-out (§ one-shot job scope):
+                // seedKey stays null and seedIndex is 0.
+                seedKey: null,
+                seedIndex: occurrence.seedIndex,
+                pageIndex: occurrence.pageIndex,
+                position: occurrence.position,
+                createdAt: now,
+            })
+            .onConflictDoNothing({
+                target: [schemas.datasetRunItems.datasetRunId, schemas.datasetRunItems.itemKey],
+            });
+    }
+
+    /**
+     * Assign a contiguous sequence (1..N) to a finalized run's members, ordered by
+     * (seed_index, page_index, position, created_at, uuid). Idempotent: if every
+     * member already has a sequence (a replay of an already-finalized run), it is a
+     * no-op. Otherwise it clears sequences to NULL first, then reassigns from an
+     * all-NULL base — so per-row assignment can never transiently violate the
+     * partial unique(dataset_run_id, sequence) constraint in either dialect.
+     */
+    private static async assignRunItemSequences(tx: DBExecutor, runId: string): Promise<void> {
+        const rows = await tx
+            .select({
+                uuid: schemas.datasetRunItems.uuid,
+                sequence: schemas.datasetRunItems.sequence,
+            })
+            .from(schemas.datasetRunItems)
+            .where(eq(schemas.datasetRunItems.datasetRunId, runId))
+            .orderBy(
+                sql`${schemas.datasetRunItems.seedIndex} ASC,
+                    ${schemas.datasetRunItems.pageIndex} ASC,
+                    ${schemas.datasetRunItems.position} ASC,
+                    ${schemas.datasetRunItems.createdAt} ASC,
+                    ${schemas.datasetRunItems.uuid} ASC`
+            );
+
+        if (rows.length === 0) return;
+
+        // Idempotency guard: nothing to do if the run is already fully sequenced.
+        const hasUnassigned = rows.some((r: any) => r.sequence === null || r.sequence === undefined);
+        if (!hasUnassigned) return;
+
+        // Reset to an all-NULL base so the reassignment below cannot collide with a
+        // value some other row currently holds under the partial-unique index.
+        await tx
+            .update(schemas.datasetRunItems)
+            .set({ sequence: null })
+            .where(eq(schemas.datasetRunItems.datasetRunId, runId));
+
+        let seq = 1;
+        for (const r of rows) {
+            await tx
+                .update(schemas.datasetRunItems)
+                .set({ sequence: seq })
+                .where(eq(schemas.datasetRunItems.uuid, r.uuid));
+            seq++;
+        }
     }
 
     // --- Optional projections (dataset_item_field_values) -------------------

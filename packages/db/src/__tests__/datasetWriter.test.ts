@@ -29,6 +29,62 @@ const countRows = (table: string): number =>
 const changesByType = (type: string): number =>
     (sqlite.prepare(`SELECT COUNT(*) AS c FROM dataset_item_changes WHERE change_type = ?`).get(type) as any).c;
 
+const SEARCH_MAPPING = { name: "anycrawl_search_result", version: "1.0.0" };
+const CRAWL_MAPPING = { name: "anycrawl_crawl_page", version: "1.0.0" };
+
+/** uuid of a run keyed by (dataset, producer_type, producer_id). */
+const runIdOf = (datasetId: string, producerType: string, producerId: string): string =>
+    (sqlite
+        .prepare(
+            `SELECT uuid FROM dataset_runs WHERE dataset_id = ? AND producer_type = ? AND producer_id = ?`
+        )
+        .get(datasetId, producerType, producerId) as any).uuid;
+
+/** All run_items for a run, in the read-API order (COALESCE(sequence, maxint), uuid). */
+const runItemsOf = (runId: string): any[] =>
+    sqlite
+        .prepare(
+            `SELECT uuid, dataset_item_id, item_key, sequence, seed_key, seed_index, page_index, position
+             FROM dataset_run_items WHERE dataset_run_id = ?
+             ORDER BY COALESCE(sequence, 2147483647), uuid`
+        )
+        .all(runId) as any[];
+
+/** uuid of the dataset_items row for a given (dataset, item_key). */
+const itemIdOf = (datasetId: string, itemKey: string): string =>
+    (sqlite
+        .prepare(`SELECT uuid FROM dataset_items WHERE dataset_id = ? AND item_key = ?`)
+        .get(datasetId, itemKey) as any).uuid;
+
+/** General producer write (scrape/search/crawl) with optional finalize/pageIndex. */
+async function writeRun(opts: {
+    jobId: string;
+    result: unknown;
+    dataset: any;
+    scopeType: "scrape" | "search" | "crawl";
+    producerType: string;
+    mapping: any;
+    producerId?: string;
+    finalizeRun?: boolean;
+    pageIndex?: number;
+}) {
+    return DatasetWriter.writeResultToDataset({
+        producerType: opts.producerType,
+        producerId: opts.producerId ?? opts.jobId,
+        jobId: opts.jobId,
+        scope: { kind: "job", jobId: opts.jobId },
+        scopeType: opts.scopeType,
+        result: opts.result,
+        mapping: opts.mapping,
+        owner: OWNER,
+        dataset: opts.dataset,
+        dbOrTx: db,
+        now: new Date(),
+        finalizeRun: opts.finalizeRun,
+        pageIndex: opts.pageIndex,
+    });
+}
+
 function scrapeDoc(url: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
     return { url, title: "Title", markdown: "hello world", ...extra };
 }
@@ -220,5 +276,161 @@ describe("DatasetWriter mapping + guards", () => {
         expect(out.itemsCreated).toBe(0);
         expect(out.status).toBe("partial");
         expect(out.warnings.some((w: any) => w.code === "item_too_large")).toBe(true);
+    });
+});
+
+describe("DatasetWriter run membership (dataset_run_items)", () => {
+    const U1 = "https://ri.test/1";
+    const U2 = "https://ri.test/2";
+    const U3 = "https://ri.test/3";
+    const U4 = "https://ri.test/4";
+
+    let datasetId: string;
+    let run1Id: string;
+
+    it("records membership for every created item with a contiguous sequence (finalized search run)", async () => {
+        const out = await writeRun({
+            jobId: "ri-s1",
+            scopeType: "search",
+            producerType: "search",
+            mapping: SEARCH_MAPPING,
+            result: [
+                { url: U1, title: "a" },
+                { url: U2, title: "b" },
+                { url: U3, title: "c" },
+            ],
+            dataset: { create: { name: "RunItems DS" } },
+        });
+        datasetId = out.datasetId;
+        expect(out.status).toBe("completed");
+        expect(out.itemsCreated).toBe(3);
+
+        run1Id = runIdOf(datasetId, "search", "ri-s1");
+        const items = runItemsOf(run1Id);
+
+        // One membership row per item seen this run.
+        expect(items).toHaveLength(3);
+        // Sequence is contiguous 1..N in occurrence (position) order.
+        expect(items.map((r) => r.sequence)).toEqual([1, 2, 3]);
+        expect(items.map((r) => r.item_key)).toEqual([U1, U2, U3]);
+        // Occurrence fields for a one-shot job scope.
+        expect(items.map((r) => r.position)).toEqual([0, 1, 2]);
+        expect(items.every((r) => r.seed_index === 0)).toBe(true);
+        expect(items.every((r) => r.page_index === 0)).toBe(true);
+        expect(items.every((r) => r.seed_key === null)).toBe(true);
+        // dataset_item_id links to the real dataset_items row for that key.
+        for (const r of items) {
+            expect(r.dataset_item_id).toBe(itemIdOf(datasetId, r.item_key));
+        }
+    });
+
+    it("records membership for created + updated + unchanged items in one run", async () => {
+        const out = await writeRun({
+            jobId: "ri-s2",
+            scopeType: "search",
+            producerType: "search",
+            mapping: SEARCH_MAPPING,
+            result: [
+                { url: U1, title: "a" }, // identical → unchanged
+                { url: U2, title: "b2" }, // changed title → updated
+                { url: U4, title: "d" }, // new → created
+            ],
+            dataset: { datasetId },
+        });
+        expect(out.itemsCreated).toBe(1);
+        expect(out.itemsUpdated).toBe(1);
+        expect(out.itemsUnchanged).toBe(1);
+
+        const run2Id = runIdOf(datasetId, "search", "ri-s2");
+        const items = runItemsOf(run2Id);
+
+        // Membership is independent of change: all three are members.
+        expect(items).toHaveLength(3);
+        expect(items.map((r) => r.item_key)).toEqual([U1, U2, U4]);
+        expect(items.map((r) => r.sequence)).toEqual([1, 2, 3]);
+    });
+
+    it("is idempotent on replay: no duplicate run_items and sequence is stable", async () => {
+        const before = runItemsOf(run1Id);
+        const totalBefore = countRows("dataset_run_items");
+
+        // Replay the exact same producer message for run 1.
+        await writeRun({
+            jobId: "ri-s1",
+            scopeType: "search",
+            producerType: "search",
+            mapping: SEARCH_MAPPING,
+            result: [
+                { url: U1, title: "a" },
+                { url: U2, title: "b" },
+                { url: U3, title: "c" },
+            ],
+            dataset: { datasetId },
+        });
+
+        const after = runItemsOf(run1Id);
+        // Same rows, same uuids, same sequences — nothing re-inserted or re-numbered.
+        expect(after).toHaveLength(3);
+        expect(after.map((r) => r.sequence)).toEqual([1, 2, 3]);
+        expect(after.map((r) => r.uuid)).toEqual(before.map((r) => r.uuid));
+        expect(countRows("dataset_run_items")).toBe(totalBefore);
+    });
+
+    it("leaves sequence NULL for a non-finalized crawl run and accumulates members per page", async () => {
+        const crawlJob = "ri-crawl-1";
+
+        // Page 1 creates the dataset; finalizeRun:false keeps the run 'running'.
+        const p1 = await writeRun({
+            jobId: crawlJob,
+            producerId: crawlJob,
+            scopeType: "crawl",
+            producerType: "crawl",
+            mapping: CRAWL_MAPPING,
+            result: scrapeDoc(U1),
+            dataset: { create: { name: "Crawl DS" } },
+            finalizeRun: false,
+            pageIndex: 0,
+        });
+        expect(p1.status).toBe("running");
+        const crawlDatasetId = p1.datasetId;
+
+        // Page 2 of the same crawl → same run, next page index.
+        await writeRun({
+            jobId: crawlJob,
+            producerId: crawlJob,
+            scopeType: "crawl",
+            producerType: "crawl",
+            mapping: CRAWL_MAPPING,
+            result: scrapeDoc(U2),
+            dataset: { datasetId: crawlDatasetId },
+            finalizeRun: false,
+            pageIndex: 1,
+        });
+
+        const crawlRunId = runIdOf(crawlDatasetId, "crawl", crawlJob);
+        const items = runItemsOf(crawlRunId);
+
+        expect(items).toHaveLength(2);
+        // Sequence stays NULL during a non-finalized run.
+        expect(items.every((r) => r.sequence === null)).toBe(true);
+        // Per-page counter is recorded; position is 0-based within each page batch.
+        expect(items.map((r) => r.page_index).sort()).toEqual([0, 1]);
+        expect(items.every((r) => r.position === 0)).toBe(true);
+
+        // Replaying page 1 must not add a duplicate member or assign a sequence.
+        await writeRun({
+            jobId: crawlJob,
+            producerId: crawlJob,
+            scopeType: "crawl",
+            producerType: "crawl",
+            mapping: CRAWL_MAPPING,
+            result: scrapeDoc(U1),
+            dataset: { datasetId: crawlDatasetId },
+            finalizeRun: false,
+            pageIndex: 0,
+        });
+        const afterReplay = runItemsOf(crawlRunId);
+        expect(afterReplay).toHaveLength(2);
+        expect(afterReplay.every((r) => r.sequence === null)).toBe(true);
     });
 });

@@ -209,6 +209,67 @@ export type CrawlAndWaitResult = {
     data: any[];
 };
 
+// ---------------------------------------------------------------------------
+// Dedicated template endpoints (POST /v1/template/{ref}/execute, GET /v1/template/{ref})
+// ---------------------------------------------------------------------------
+
+/** The kind of API call a template drives. */
+export type TemplateType = 'scrape' | 'search' | 'crawl';
+
+/**
+ * Body accepted by POST /v1/template/{ref}/execute.
+ * Only these fields are permitted — every other option comes from the template.
+ * `url` is used by scrape/crawl templates; `query` by search templates. Either may
+ * be optional if the template predefines it.
+ */
+export type TemplateExecuteRequest = {
+    url?: string;
+    query?: string;
+    variables?: Record<string, any>;
+};
+
+/**
+ * Result of executing a template, discriminated by the template's type:
+ * - scrape -> ScrapeResult
+ * - search -> SearchResult[]
+ * - crawl  -> CrawlJobResponse (async; poll /v1/crawl/{job_id})
+ */
+export type TemplateExecuteResult = ScrapeResult | SearchResult[] | CrawlJobResponse;
+
+/** A single variable a template declares in its call-spec. */
+export type TemplateVariableSpec = {
+    type: 'string' | 'number' | 'boolean' | 'url';
+    required?: boolean;
+    defaultValue?: any;
+    description?: string;
+} & Record<string, any>;
+
+/**
+ * Redacted call-spec returned by GET /v1/template/{ref}. Describes a template's
+ * inputs, pricing and endpoint for discovery. Never exposes internal handlers.
+ */
+export type TemplateSpec = {
+    template_id: string;
+    slug: string | null;
+    name: string;
+    description?: string | null;
+    template_type: TemplateType;
+    version: number | string;
+    endpoint: {
+        method: string;
+        path: string;
+    };
+    variables: Record<string, TemplateVariableSpec>;
+    pricing?: {
+        perCall?: number;
+        currency?: string;
+    } & Record<string, any>;
+    allowed_domains?: {
+        type?: 'exact' | 'glob';
+        patterns?: string[];
+    } | null;
+};
+
 // Batch scrape types (async job model; options are shared across all URLs)
 export type BatchScrapeRequest = {
     urls: string[];
