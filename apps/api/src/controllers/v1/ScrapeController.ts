@@ -2,7 +2,8 @@ import { Response } from "express";
 import { z } from "zod";
 import { scrapeSchema, RequestWithAuth, CreditCalculator, WebhookEventType, getCacheConfig, getResolvedProxyMode } from "@anycrawl/libs";
 import { QueueManager, CrawlerErrorType, CacheManager, resolveAutoEngine } from "@anycrawl/scrape";
-import { STATUS, createJob, failedJob, completedJob, insertJobResult, updateJobCacheHits } from "@anycrawl/db";
+import { STATUS, createJob, failedJob, completedJob, insertJobResult, updateJobCacheHits, writeResultToDataset, assertDatasetWritable, parseDatasetOutput, standardDatasetMapping, DatasetWriteError, type ParsedDatasetOutput, type DatasetMapping } from "@anycrawl/db";
+import type { OwnerContext } from "@anycrawl/libs";
 import { log } from "@anycrawl/libs";
 import { TemplateHandler, TemplateVariableMapper } from "../../utils/templateHandler.js";
 import { validateTemplateOnlyFields } from "../../utils/templateValidator.js";
@@ -38,6 +39,42 @@ export class ScrapeController {
         return explicitTimeoutMs ?? baseTimeoutMs;
     }
 
+    /**
+     * Run the Dataset Writer for a completed sync result and return the `dataset`
+     * splice. Fail-closed: any Writer error becomes `{ status: "failed" }` + warning
+     * so the scraped data is never dropped and the HTTP status never becomes 500.
+     */
+    private writeDatasetSafe = async (args: {
+        datasetOutput: ParsedDatasetOutput;
+        mapping: DatasetMapping;
+        owner: OwnerContext;
+        jobId: string;
+        result: unknown;
+    }): Promise<Record<string, unknown>> => {
+        try {
+            const outcome = await writeResultToDataset({
+                producerType: "scrape",
+                producerId: args.jobId,
+                jobId: args.jobId,
+                scope: { kind: "job", jobId: args.jobId },
+                scopeType: "scrape",
+                result: args.result,
+                mapping: args.mapping,
+                owner: args.owner,
+                dataset: args.datasetOutput.dataset,
+            });
+            return {
+                dataset_id: outcome.datasetId,
+                dataset_run_id: outcome.datasetRunId,
+                status: outcome.status,
+            };
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            log.warning(`[SCRAPE] Dataset write failed for job ${args.jobId}: ${message}`);
+            return { status: "failed", warning: message };
+        }
+    };
+
     public handle = async (req: RequestWithAuth, res: Response): Promise<void> => {
         let jobId: string | null = null;
         let engineName: string | null = null;
@@ -65,6 +102,11 @@ export class ScrapeController {
             } else {
                 log.debug(`[SCRAPE] Received non-object body type=${typeof rawBody}`);
             }
+
+            // Dataset output is an additive, non-schema field: capture it from the raw
+            // body up front, then strip it so the scrape schema (and no-dataset path)
+            // are byte-for-byte unchanged.
+            const rawDatasetOutput = (rawBody && typeof rawBody === "object") ? (rawBody as any).output : undefined;
 
             // Merge template options with request body before parsing
             let requestData = { ...req.body };
@@ -94,6 +136,9 @@ export class ScrapeController {
                 }
             } catch { /* ignore render errors; schema will validate later */ }
 
+            // Never feed `output` to the (strict-ish) scrape schema.
+            if (requestData && typeof requestData === "object") delete (requestData as any).output;
+
             const hasExplicitTimeout = Object.prototype.hasOwnProperty.call(requestData, "timeout");
 
             // Validate and parse the merged data
@@ -103,6 +148,26 @@ export class ScrapeController {
                 (jobPayload as any).engine = engineName;
             } else {
                 engineName = jobPayload.engine;
+            }
+
+            // Resolve the dataset output config (null unless output.dataset present).
+            const datasetOutput = parseDatasetOutput(rawDatasetOutput, { defaultName: `Scrape ${jobPayload.url}` });
+            const datasetMapping = standardDatasetMapping("scrape");
+            const datasetOwner: OwnerContext = { apiKeyId: req.auth?.uuid, userId: req.auth?.user };
+            if (datasetOutput) {
+                // Eagerly validate an existing dataset (owner + schema) so a bad
+                // dataset_id fails 404/409 before any job/credits are spent.
+                try {
+                    await assertDatasetWritable({ owner: datasetOwner, dataset: datasetOutput.dataset, mapping: datasetMapping });
+                } catch (dsError) {
+                    if (dsError instanceof DatasetWriteError) {
+                        req.creditsUsed = 0;
+                        req.billingChargeDetails = undefined;
+                        res.status(dsError.httpStatus).json({ success: false, error: dsError.code, message: dsError.message });
+                        return;
+                    }
+                    throw dsError;
+                }
             }
 
             // Check cache before creating job (if max_age > 0 or undefined)
@@ -232,7 +297,17 @@ export class ScrapeController {
                             responseData["screenshot@fullPage"] = `${process.env.ANYCRAWL_DOMAIN}/v1/public/storage/file/${responseData["screenshot@fullPage"]}`;
                         }
 
-                        res.json({ success: true, data: responseData });
+                        const cacheResponse: Record<string, unknown> = { success: true, data: responseData };
+                        if (datasetOutput) {
+                            cacheResponse.dataset = await this.writeDatasetSafe({
+                                datasetOutput,
+                                mapping: datasetMapping,
+                                owner: datasetOwner,
+                                jobId: cacheJobId,
+                                result: jobResultData,
+                            });
+                        }
+                        res.json(cacheResponse);
                         return;
                     }
                 } catch (cacheError) {
@@ -337,10 +412,17 @@ export class ScrapeController {
 
             // Job completion is handled in worker/engine; no extra completedJob call here
 
-            res.json({
-                success: true,
-                data: jobData,
-            });
+            const scrapeResponse: Record<string, unknown> = { success: true, data: jobData };
+            if (datasetOutput) {
+                scrapeResponse.dataset = await this.writeDatasetSafe({
+                    datasetOutput,
+                    mapping: datasetMapping,
+                    owner: datasetOwner,
+                    jobId: jobId!,
+                    result: jobData,
+                });
+            }
+            res.json(scrapeResponse);
         } catch (error) {
             if (error instanceof z.ZodError) {
                 const formattedErrors = error.errors.map((err) => ({

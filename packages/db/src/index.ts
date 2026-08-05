@@ -21,6 +21,14 @@ import {
     listSnapshotsByMonitor as listSnapshotsByMonitorFn,
     listChangesByMonitor as listChangesByMonitorFn,
 } from "./model/MonitorAccess.js";
+import {
+    buildDatasetWhereClause as buildDatasetWhereClauseByOwner,
+    getOwnedDataset as getOwnedDatasetByOwner,
+    getDataset as getDatasetFn,
+    resolveDatasetOwnerScope as resolveDatasetOwnerScopeFn,
+} from "./model/DatasetAccess.js";
+import { Dataset } from "./model/Dataset.js";
+import { DatasetWriter } from "./model/DatasetWriter.js";
 
 // Backward compatibility functions
 export const createJob = Job.create;
@@ -39,6 +47,8 @@ export const addJobTraffic = Job.addTraffic;
 
 export const createTemplate = Template.create;
 export const getTemplate = Template.get;
+export const getTemplateBySlug = Template.getBySlug;
+export const resolveTemplateByRef = Template.resolveByRef;
 export const getTemplateByUuid = Template.getByUuid;
 export const updateTemplate = Template.update;
 export const deleteTemplate = Template.delete;
@@ -63,6 +73,51 @@ export const getLatestSnapshot = getLatestSnapshotFn;
 export const listSnapshotsByMonitor = listSnapshotsByMonitorFn;
 export const listChangesByMonitor = listChangesByMonitorFn;
 
+// Dataset ownership + access helpers
+export const buildDatasetWhereClause = buildDatasetWhereClauseByOwner;
+export const getOwnedDataset = getOwnedDatasetByOwner;
+export const getDataset = getDatasetFn;
+export const resolveDatasetOwnerScope = resolveDatasetOwnerScopeFn;
+
+// Dataset model (create + list/read query helpers)
+export const createDataset = Dataset.create;
+export const updateDataset = Dataset.update;
+export const softDeleteDataset = Dataset.softDelete;
+export const listDatasetsByOwner = Dataset.listByOwner;
+export const getDatasetProjectionFields = Dataset.getProjectionFields;
+export const getDatasetItems = Dataset.getItems;
+export const listDatasetRuns = Dataset.listRuns;
+export const getDatasetRun = Dataset.getRun;
+export const listDatasetRunItems = Dataset.listRunItems;
+export const listDatasetChanges = Dataset.listChanges;
+export const listRunWarnings = Dataset.listRunWarnings;
+
+// Dataset Writer (producer write-path service). Additive: only invoked when a
+// request carries `output.dataset` — the no-dataset path is untouched.
+export const writeResultToDataset = DatasetWriter.writeResultToDataset.bind(DatasetWriter);
+export const assertDatasetWritable = DatasetWriter.assertDatasetWritable.bind(DatasetWriter);
+export const parseDatasetOutput = DatasetWriter.parseOutput.bind(DatasetWriter);
+export const standardDatasetMapping = DatasetWriter.standardMapping.bind(DatasetWriter);
+export {
+    DatasetWriter,
+    DatasetWriteError,
+    DatasetNotFoundError,
+    DatasetSchemaMismatchError,
+} from "./model/DatasetWriter.js";
+export type {
+    WriteResultToDatasetParams,
+    WriteResultToDatasetOutcome,
+    DatasetRunStatus,
+    DatasetScopeType,
+    DatasetMapping,
+    DatasetTarget,
+    DatasetCreateSpec,
+    DatasetProjectionSpec,
+    ParsedDatasetOutput,
+    RunWarning as DatasetRunWarning,
+} from "./model/DatasetWriter.js";
+export { computeDocumentHash, shallowFieldDiff } from "./model/documentHash.js";
+
 // Template system exports
 export { templates, templateExecutions, billingLedger } from "./db/schemas/PostgreSQL.js";
 
@@ -83,5 +138,43 @@ export {
     monitorChanges,
 } from "./db/schemas/PostgreSQL.js";
 
-export { eq, and, gt, gte, sql, desc, getDB, schemas, STATUS, JOB_RESULT_STATUS, Job, Billing };
+// Dataset (L2) table exports
+export {
+    datasets,
+    datasetRuns,
+    datasetItems,
+    datasetRunItems,
+    datasetItemScopes,
+    datasetItemChanges,
+    datasetItemFieldValues,
+    runWarnings,
+} from "./db/schemas/PostgreSQL.js";
+
+export { eq, and, gt, gte, sql, desc, getDB, schemas, STATUS, JOB_RESULT_STATUS, Job, Billing, Dataset };
 export type { CreateJobParams, CreateTemplateParams };
+export type {
+    FieldType as DatasetFieldType,
+    FilterOp as DatasetFilterOp,
+    ItemFilter as DatasetItemFilter,
+    ItemSort as DatasetItemSort,
+    CursorKey as DatasetCursorKey,
+    PageResult as DatasetPageResult,
+} from "./model/Dataset.js";
+
+// Slug write-path validation (design doc §5.7). Exported so API callers can map
+// SlugValidationError.httpStatus/code to HTTP 400/409 responses.
+export {
+    validateSlug,
+    validateSlugFormat,
+    isSlugUniqueViolation,
+    SlugValidationError,
+    SLUG_REGEX,
+    SLUG_MIN_LENGTH,
+    SLUG_MAX_LENGTH,
+    RESERVED_SLUGS,
+} from "./model/slug.js";
+export type {
+    SlugValidationDeps,
+    SlugValidationErrorCode,
+    ValidateSlugOptions,
+} from "./model/slug.js";

@@ -2,7 +2,8 @@ import { Response } from "express";
 import { z } from "zod";
 import { crawlSchema, RequestWithAuth, CrawlSchemaInput, CreditCalculator, estimateTaskCredits, WebhookEventType, appConfig } from "@anycrawl/libs";
 import { QueueManager, CrawlerErrorType, RequestTask, ProgressManager, AVAILABLE_ENGINES, runAutoCrawl } from "@anycrawl/scrape";
-import { cancelJob, createJob, failedJob, getJob, getJobResultsPaginated, getJobResultsCount, STATUS, getTemplate } from "@anycrawl/db";
+import { cancelJob, createJob, failedJob, getJob, getJobResultsPaginated, getJobResultsCount, STATUS, getTemplate, getDB, createDataset, assertDatasetWritable, parseDatasetOutput, standardDatasetMapping, DatasetWriteError } from "@anycrawl/db";
+import type { OwnerContext } from "@anycrawl/libs";
 import { log } from "@anycrawl/libs";
 import { TemplateHandler } from "../../utils/templateHandler.js";
 import { validateTemplateOnlyFields } from "../../utils/templateValidator.js";
@@ -18,6 +19,11 @@ export class CrawlController {
         let jobId: string | null = null;
         let defaultPrice: number = 0;
         try {
+            // Dataset output is an additive, non-schema field: capture from the raw
+            // body up front, then strip it before the (strict) crawl schema so the
+            // no-dataset path is unchanged.
+            const rawDatasetOutput = (req.body && typeof req.body === "object") ? (req.body as any).output : undefined;
+
             // Merge template options with request body before parsing
             let requestData = { ...req.body };
 
@@ -46,8 +52,55 @@ export class CrawlController {
                 }
             } catch { /* ignore render errors; schema will validate later */ }
 
+            // The strict crawl schema rejects unknown keys — strip `output` first.
+            if (requestData && typeof requestData === "object") delete (requestData as any).output;
+
             // Validate and parse the merged data
             const jobPayload = crawlSchema.parse(requestData);
+
+            // Resolve/validate the dataset output up front (async producer): create
+            // or bind the dataset now so we can return its id and propagate it to the
+            // crawl worker, which writes each page via the shared Dataset Writer.
+            const datasetOutput = parseDatasetOutput(rawDatasetOutput, { defaultName: `Crawl ${jobPayload.url}` });
+            const datasetMapping = standardDatasetMapping("crawl");
+            const datasetOwner: OwnerContext = { apiKeyId: req.auth?.uuid, userId: req.auth?.user };
+            let boundDatasetId: string | null = null;
+            if (datasetOutput) {
+                try {
+                    await assertDatasetWritable({ owner: datasetOwner, dataset: datasetOutput.dataset, mapping: datasetMapping });
+                    if ("datasetId" in datasetOutput.dataset) {
+                        boundDatasetId = datasetOutput.dataset.datasetId;
+                    } else {
+                        const db = await getDB();
+                        const created = await createDataset(db, {
+                            apiKeyId: datasetOwner.apiKeyId ?? null,
+                            userId: datasetOwner.userId ?? null,
+                            name: datasetOutput.dataset.create.name,
+                            description: datasetOutput.dataset.create.description ?? null,
+                            sourceType: "crawl",
+                            schemaName: datasetMapping.name,
+                            schemaVersion: datasetMapping.version,
+                            retentionPolicy: datasetOutput.dataset.create.retentionPolicy ?? null,
+                        });
+                        boundDatasetId = created.uuid;
+                    }
+                    // Propagate to the worker via crawl options (flows into request.userData).
+                    (jobPayload.options as any).dataset = {
+                        datasetId: boundDatasetId,
+                        scopeType: "crawl",
+                        mapping: datasetMapping,
+                        owner: datasetOwner,
+                    };
+                } catch (dsError) {
+                    if (dsError instanceof DatasetWriteError) {
+                        req.creditsUsed = 0;
+                        req.billingChargeDetails = undefined;
+                        res.status(dsError.httpStatus).json({ success: false, error: dsError.code, message: dsError.message });
+                        return;
+                    }
+                    throw dsError;
+                }
+            }
 
             // Check if user has enough credits for the requested limit
             if (req.auth && appConfig.authEnabled && appConfig.creditsEnabled) {
@@ -144,13 +197,15 @@ export class CrawlController {
             );
 
             // Return immediately with job ID (async processing)
+            const crawlData: Record<string, unknown> = {
+                job_id: jobId,
+                status: 'created',
+                message: 'Crawl job has been queued for processing',
+            };
+            if (boundDatasetId) crawlData.dataset_id = boundDatasetId;
             res.json({
                 success: true,
-                data: {
-                    job_id: jobId,
-                    status: 'created',
-                    message: 'Crawl job has been queued for processing',
-                }
+                data: crawlData,
             });
         } catch (error) {
             if (error instanceof z.ZodError) {

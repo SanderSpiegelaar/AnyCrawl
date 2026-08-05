@@ -13,7 +13,7 @@ import {
     ResponseStatus,
     CrawlerResponse
 } from "../types/crawler.js";
-import { insertJobResult, failedJob, completedJob, Billing, JOB_RESULT_STATUS } from "@anycrawl/db";
+import { insertJobResult, failedJob, completedJob, Billing, JOB_RESULT_STATUS, writeResultToDataset } from "@anycrawl/db";
 import { ProgressManager } from "../managers/Progress.js";
 import { CacheManager } from "../managers/Cache.js";
 import { log, JOB_TYPE_CRAWL, JOB_TYPE_SCRAPE, CreditCalculator, resolveWaitUntil, appConfig, config } from "@anycrawl/libs";
@@ -1198,6 +1198,46 @@ export abstract class BaseEngine {
                 if (shouldScrape) {
                     const resultStatus = isHttpError ? JOB_RESULT_STATUS.FAILED : JOB_RESULT_STATUS.SUCCESS;
                     await insertJobResult(resultJobId, context.request.url, data, resultStatus);
+
+                    // Dataset output (additive): for crawl jobs carrying an output.dataset
+                    // binding, persist this successful page via the shared Dataset Writer.
+                    // Fully isolated — a write failure only warns; it never fails the page.
+                    if (
+                        !isHttpError &&
+                        context.request.userData.type === JOB_TYPE_CRAWL &&
+                        context.request.userData.crawl_options?.dataset
+                    ) {
+                        const dsConfig = context.request.userData.crawl_options.dataset as {
+                            datasetId: string;
+                            scopeType: "crawl";
+                            mapping: any;
+                            owner: any;
+                        };
+                        // Key the run by the crawl job (parentId), so every page of a
+                        // crawl maps to a SINGLE dataset_run — for both the in-crawler
+                        // link-following path (parentId === jobId) and the auto-crawl
+                        // coordinator path (each page is a child job with parentId set).
+                        const crawlJobId = (context.request.userData.parentId || context.request.userData.jobId) as string;
+                        try {
+                            await writeResultToDataset({
+                                producerType: "crawl",
+                                producerId: crawlJobId,
+                                jobId: crawlJobId,
+                                scope: { kind: "job", jobId: crawlJobId },
+                                scopeType: "crawl",
+                                result: data,
+                                mapping: dsConfig.mapping,
+                                owner: dsConfig.owner,
+                                dataset: { datasetId: dsConfig.datasetId },
+                                // Per-page write of a multi-page run: accumulate, don't finalize.
+                                finalizeRun: false,
+                            });
+                        } catch (datasetError) {
+                            log.warning(
+                                `[${context.request.userData.queueName}] [${crawlJobId}] Dataset write failed for ${context.request.url}: ${datasetError instanceof Error ? datasetError.message : String(datasetError)}`
+                            );
+                        }
+                    }
 
                     // Save to cache only for successful responses
                     try {

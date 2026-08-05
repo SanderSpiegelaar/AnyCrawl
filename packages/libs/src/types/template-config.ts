@@ -33,6 +33,8 @@ export interface TemplateConfig {
     // Basic information
     uuid: string;
     templateId: string;
+    // Optional vanity slug for human-friendly dedicated endpoints. Globally unique when set.
+    slug?: string | null;
     name: string;
     description?: string;
     tags: string[];

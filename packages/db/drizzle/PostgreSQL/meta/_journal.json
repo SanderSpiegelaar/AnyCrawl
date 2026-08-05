@@ -127,6 +127,20 @@
       "when": 1783783421018,
       "tag": "0017_sad_snowbird",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1785941937944,
+      "tag": "0018_add_template_slug",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1785945314605,
+      "tag": "0019_dataset_core_tables",
+      "breakpoints": true
     }
   ]
 }
