@@ -152,6 +152,15 @@ export class TemplateEndpointController {
                 variables: template.variables ?? {},
                 pricing: template.pricing,
                 allowed_domains: metadata.allowedDomains ?? null,
+                // L3: lets a client pick sync (/execute) vs async orchestrated (/runs)
+                // and know whether results can be written to a Dataset.
+                runtime: { mode: template.runtime?.mode ?? "single" },
+                output: {
+                    dataset_supported: true,
+                    schema: template.outputSchema
+                        ? { name: template.outputSchema.name, version: template.outputSchema.version }
+                        : null,
+                },
             },
         });
     };
