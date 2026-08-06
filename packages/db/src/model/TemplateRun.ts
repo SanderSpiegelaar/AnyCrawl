@@ -60,6 +60,10 @@ export interface UpdateTemplateRunStatusPatch {
     statistics?: Record<string, unknown> | null;
     startedAt?: Date | null;
     finishedAt?: Date | null;
+    /** Legacy adapter association pointers, written once execution resolves them. */
+    datasetId?: string | null;
+    datasetRunUuid?: string | null;
+    legacyJobUuid?: string | null;
 }
 
 export interface FinalizeTemplateRunExtras {
@@ -163,6 +167,32 @@ export class TemplateRun {
     }
 
     /**
+     * Fetch the canonical run for an idempotency scope (§6.2 rule 5/9). The
+     * `idempotencyScopeHash` already bakes in Owner + Template + key, so a match
+     * uniquely identifies the original run. The create endpoint uses this to
+     * detect a retry: same normalized input → return the original run (200);
+     * different input under the same key → `409 idempotency_conflict`.
+     */
+    static async getByIdempotency(
+        templateUuid: string,
+        idempotencyScopeHash: string,
+        dbOrTx?: DBExecutor
+    ): Promise<any | null> {
+        const db = dbOrTx ?? (await getDB());
+        const rows = await db
+            .select()
+            .from(schemas.templateRuns)
+            .where(
+                and(
+                    eq(schemas.templateRuns.templateUuid, templateUuid),
+                    eq(schemas.templateRuns.idempotencyScopeHash, idempotencyScopeHash)
+                )
+            )
+            .limit(1);
+        return rows[0] ?? null;
+    }
+
+    /**
      * Patch mutable lifecycle fields. Only applies while the run is still
      * non-terminal so a completed/failed/cancelled run is never re-written
      * (§5 rule 3). Returns the updated row, or null when the run is missing or
@@ -182,6 +212,9 @@ export class TemplateRun {
         if (patch.statistics !== undefined) updateData.statistics = patch.statistics;
         if (patch.startedAt !== undefined) updateData.startedAt = patch.startedAt;
         if (patch.finishedAt !== undefined) updateData.finishedAt = patch.finishedAt;
+        if (patch.datasetId !== undefined) updateData.datasetId = patch.datasetId;
+        if (patch.datasetRunUuid !== undefined) updateData.datasetRunUuid = patch.datasetRunUuid;
+        if (patch.legacyJobUuid !== undefined) updateData.legacyJobUuid = patch.legacyJobUuid;
 
         const result = await db
             .update(schemas.templateRuns)
