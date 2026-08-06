@@ -113,3 +113,56 @@ export async function listTemplateRunsByOwner(
     }
     return { items, nextCursor };
 }
+
+/**
+ * List a Template Run's warnings (§6.2 rule 8), cursor on (created_at DESC,
+ * uuid DESC), optionally filtered by code/scope/item_key. Reads the shared
+ * `run_warnings` table by its `template_run_uuid` link (populated by the Legacy
+ * Run Adapter when a run writes a dataset), which is the run-scoped counterpart
+ * to DatasetController's dataset-run-scoped warnings feed. Backed by
+ * `ix_run_warnings_template_run`.
+ */
+export async function listTemplateRunWarnings(
+    db: DBExecutor,
+    templateRunUuid: string,
+    opts: {
+        limit: number;
+        cursor?: CursorKey | null;
+        code?: string;
+        scope?: string;
+        itemKey?: string;
+    }
+): Promise<PageResult> {
+    const conditions: any[] = [eq(schemas.runWarnings.templateRunUuid, templateRunUuid)];
+    if (opts.code) conditions.push(eq(schemas.runWarnings.code, opts.code));
+    if (opts.scope) conditions.push(eq(schemas.runWarnings.scope, opts.scope));
+    if (opts.itemKey) conditions.push(eq(schemas.runWarnings.itemKey, opts.itemKey));
+    if (opts.cursor) {
+        const d = new Date(Number(opts.cursor.v));
+        conditions.push(
+            or(
+                lt(schemas.runWarnings.createdAt, d),
+                and(eq(schemas.runWarnings.createdAt, d), lt(schemas.runWarnings.uuid, opts.cursor.id))
+            )
+        );
+    }
+
+    const where = conditions.length === 1 ? conditions[0] : and(...conditions);
+    const rows = await db
+        .select()
+        .from(schemas.runWarnings)
+        .where(where)
+        .orderBy(sql`${schemas.runWarnings.createdAt} DESC, ${schemas.runWarnings.uuid} DESC`)
+        .limit(opts.limit + 1);
+
+    const hasMore = rows.length > opts.limit;
+    const items = hasMore ? rows.slice(0, opts.limit) : rows;
+    const last = items[items.length - 1];
+    let nextCursor: CursorKey | null = null;
+    if (hasMore && last) {
+        const d = last.createdAt;
+        const millis = d instanceof Date ? d.getTime() : typeof d === "number" ? d : null;
+        nextCursor = { v: millis, id: last.uuid };
+    }
+    return { items, nextCursor };
+}

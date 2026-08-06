@@ -36,6 +36,7 @@ import {
     buildTemplateRunWhereClause as buildTemplateRunWhereClauseByOwner,
     getOwnedTemplateRun as getOwnedTemplateRunByOwner,
     listTemplateRunsByOwner as listTemplateRunsByOwnerOwner,
+    listTemplateRunWarnings as listTemplateRunWarningsFn,
     resolveTemplateRunOwnerScope as resolveTemplateRunOwnerScopeFn,
 } from "./model/TemplateRunAccess.js";
 
@@ -75,6 +76,7 @@ export const computeTemplateConfigHash = TemplateRevision.computeConfigHash;
 // lifecycle transitions, cancel, finalize, and the /events audit feed.
 export const createTemplateRun = TemplateRun.create;
 export const getTemplateRun = TemplateRun.get;
+export const getTemplateRunByIdempotency = TemplateRun.getByIdempotency;
 export const updateTemplateRunStatus = TemplateRun.updateStatus;
 export const requestTemplateRunCancel = TemplateRun.requestCancel;
 export const finalizeTemplateRun = TemplateRun.finalize;
@@ -85,6 +87,7 @@ export const listTemplateRunEvents = TemplateRun.listEvents;
 export const buildTemplateRunWhereClause = buildTemplateRunWhereClauseByOwner;
 export const getOwnedTemplateRun = getOwnedTemplateRunByOwner;
 export const listTemplateRunsByOwner = listTemplateRunsByOwnerOwner;
+export const listTemplateRunWarnings = listTemplateRunWarningsFn;
 export const resolveTemplateRunOwnerScope = resolveTemplateRunOwnerScopeFn;
 
 export const chargeDeltaByJobId = Billing.chargeDeltaByJobId;
