@@ -47,12 +47,13 @@ Free trial available. Use code **PROXY90** for an exclusive 10% discount.
 
 <div align="center">
   <p>
-    <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=sponsor&utm_campaign=AnyCrawl">
-      <img src="https://ac-public.anycrawl.dev/sponsors/ATLAS%20CLOUD%20LOGO_BLACK.png" alt="Atlas Cloud" width="560">
+    <a href="https://www.rapidproxy.io/?ref=AnyCrawl">
+      <img src="assets/sponsors/rapidproxy.png" alt="Rapidproxy" width="560">
     </a>
   </p>
 </div>
-AtlasCloud(https://www.atlascloud.ai/?utm_source=github&utm_medium=sponsor&utm_campaign=AnyCrawl) — Atlas Cloud gives developers one API for 300 plus models, covering video, image, and LLM. It includes DeepSeek, GPT, Claude, Flux, Kling, and Seedance.
+
+[Rapidproxy](https://www.rapidproxy.io/?ref=AnyCrawl) — RapidProxy is a high-performance proxy provider offering clean residential proxies and native static ISP IPs for web scraping, browser automation, social media automation, e-commerce, multi-account management, and large-scale data operations. With 90M+ residential IPs, smart rotation, stable sessions, high concurrency, AI-powered CAPTCHA bypass, and non-expiring traffic, RapidProxy helps developers run reliable automation tasks at scale. Residential proxies start from $0.65/GB. Use code **RAPID10** for 10% off — try it now.
 
 <div align="center">
   <p>
