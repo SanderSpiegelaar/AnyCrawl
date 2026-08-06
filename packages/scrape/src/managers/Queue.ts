@@ -1,8 +1,39 @@
 import { Job, Queue, Worker } from "bullmq";
 import { log } from "@anycrawl/libs";
+import type { OwnerContext } from "@anycrawl/libs";
 import { randomUUID } from "node:crypto";
 import { Utils } from "../Utils.js";
 import type { EngineType } from "./EngineQueue.js";
+
+/**
+ * Dataset destination carried by an orchestrated template-run job. Exactly one of
+ * `datasetId` (existing dataset) or `create` (create-on-first-write spec) is set;
+ * `mapping`/`owner` are threaded straight into the Dataset Writer per page.
+ */
+export interface TemplateRunDatasetTarget {
+    datasetId?: string;
+    create?: Record<string, any>;
+    mapping: Record<string, any>;
+    owner: OwnerContext;
+}
+
+/**
+ * Payload for a queued orchestrated Template Run (L3 `template-run` queue). The
+ * job is keyed by `runId` (stable BullMQ jobId) so a retry re-runs the SAME run
+ * and resumes its request ledger instead of creating a duplicate.
+ */
+export interface TemplateRunJobPayload {
+    type: "template-run";
+    runId: string;
+    templateRevisionId: string;
+    templateUuid: string;
+    variables: Record<string, any>;
+    runOptions?: Record<string, any>;
+    dataset: TemplateRunDatasetTarget;
+    engine?: string;
+    ownerContext?: OwnerContext;
+    queueName?: QueueName;
+}
 
 export interface RequestTaskOptions {
     headless?: boolean;
@@ -123,6 +154,33 @@ export class QueueManager {
                 delay: 1000,
             },
         });
+        return jobId;
+    }
+
+    /**
+     * Enqueue an orchestrated Template Run onto the engine-independent
+     * `template-run` queue (L3). The BullMQ jobId is pinned to `payload.runId`,
+     * so a duplicate enqueue for the same run is a no-op and a BullMQ retry
+     * re-runs the same run (which resumes its persisted request ledger rather
+     * than starting over). Returns the runId used as the jobId.
+     */
+    public async addTemplateRunJob(payload: TemplateRunJobPayload): Promise<string> {
+        const queueName = "template-run";
+        const queue = this.getQueue(queueName);
+        const jobId = payload.runId;
+        log.info(`Adding template-run job to queue ${queueName} with runId ${jobId}`);
+        await queue.add(
+            queueName,
+            { ...payload, queueName },
+            {
+                jobId,
+                attempts: 3,
+                backoff: {
+                    type: "exponential",
+                    delay: 1000,
+                },
+            }
+        );
         return jobId;
     }
 

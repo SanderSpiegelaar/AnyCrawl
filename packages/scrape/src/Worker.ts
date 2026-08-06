@@ -96,7 +96,23 @@ function parseQueueArgs(): { queues: string[], schedulerOnly: boolean } {
     return { queues, schedulerOnly };
 }
 
+// Engine-independent queues (no browser engine required). These can be started
+// on their own via --queues=<name> without initializing any scrape/crawl engine.
+const ENGINE_INDEPENDENT_QUEUES = new Set<string>(["scheduler", "template-run"]);
+
 const { queues: requestedQueues, schedulerOnly } = parseQueueArgs();
+
+// Engines are only brought up when at least one requested queue actually needs a
+// scrape/crawl engine. An empty request means "all queues" (engines needed);
+// a request naming only engine-independent queues (scheduler / template-run)
+// skips engine bring-up entirely.
+const enginesEnabled = !schedulerOnly
+    && (requestedQueues.length === 0 || requestedQueues.some(q => !ENGINE_INDEPENDENT_QUEUES.has(q)));
+
+// The orchestrated Template Run worker (L3) is engine-independent: it enqueues
+// plain scrape jobs onto the existing scrape-<engine> queues (consumed by the
+// scrape workers) rather than driving an engine itself.
+const shouldStartTemplateRun = requestedQueues.length === 0 || requestedQueues.includes('template-run');
 
 // Initialize Utils first
 const utils = Utils.getInstance();
@@ -128,7 +144,7 @@ log.info(`💳 Credits deduction enabled: ${appConfig.creditsEnabled}`);
 let AVAILABLE_ENGINES: string[] = [];
 let engineQueueManager: any;
 
-if (!schedulerOnly) {
+if (enginesEnabled) {
     log.info("Initializing queues and engines...");
     // Dynamically import after AI config is ready to ensure @anycrawl/ai is initialized with config
     const { EngineQueueManager, AVAILABLE_ENGINES: ALL_ENGINES } = await import("./managers/EngineQueue.js");
@@ -156,7 +172,10 @@ if (!schedulerOnly) {
     QueueManager.getInstance();
     log.info("All queues and engines initialized and started");
 } else {
-    log.info("🎯 Starting scheduler only (no browser queues)");
+    // Engine-independent mode (scheduler and/or template-run only): still need
+    // the QueueManager singleton so engine-independent workers can enqueue jobs.
+    QueueManager.getInstance();
+    log.info("🎯 Starting engine-independent queues only (no browser engines)");
 }
 
 // Initialize Scheduler Manager (if enabled and requested)
@@ -251,8 +270,21 @@ async function runJob(job: Job) {
             );
         }
 
-        // Workers for scrape and crawl jobs (only if not scheduler-only mode)
-        if (!schedulerOnly) {
+        // Worker for the orchestrated Template Run queue (L3). Engine-independent:
+        // each job drives the whole run (seed expansion → drain → finalize) via
+        // OrchestratedRunner, enqueuing plain scrape jobs for page fetches.
+        if (shouldStartTemplateRun) {
+            workers.push(
+                WorkerManager.getInstance().getWorker('template-run', async (job: Job) => {
+                    const { OrchestratedRunner } = await import("./template/OrchestratedRunner.js");
+                    await new OrchestratedRunner().run(job.data);
+                })
+            );
+            log.info("✅ Template Run (orchestrated) worker registered");
+        }
+
+        // Workers for scrape and crawl jobs (only when engines are enabled)
+        if (enginesEnabled) {
             // Workers for scrape jobs
             const scrapeWorkers = await Promise.all(
                 AVAILABLE_ENGINES.map(async (engineType: any) => {
@@ -347,8 +379,8 @@ async function runJob(job: Job) {
 
         log.info("Worker started successfully");
 
-        // Check queue status periodically for all engines (only if not scheduler-only)
-        if (!schedulerOnly) {
+        // Check queue status periodically for all engines (only when engines enabled)
+        if (enginesEnabled) {
             setInterval(async () => {
                 for (const engineType of AVAILABLE_ENGINES) {
                     try {
@@ -365,8 +397,8 @@ async function runJob(job: Job) {
             }, 3000); // Check every 3 seconds
         }
 
-        // Log current browser instances for browser engines (controlled by env, only if not scheduler-only)
-        if (!schedulerOnly && process.env.ANYCRAWL_LOG_BROWSER_STATUS === "true") {
+        // Log current browser instances for browser engines (controlled by env, only when engines enabled)
+        if (enginesEnabled && process.env.ANYCRAWL_LOG_BROWSER_STATUS === "true") {
             setInterval(async () => {
                 for (const engineType of AVAILABLE_ENGINES) {
                     try {
@@ -564,7 +596,7 @@ async function runJob(job: Job) {
             }
 
             // Stop all engines (if initialized)
-            if (!schedulerOnly) {
+            if (enginesEnabled) {
                 await engineQueueManager.stopEngines();
             }
 
@@ -581,7 +613,7 @@ async function runJob(job: Job) {
         process.exit(1);
     }
 })();
-// Start engines (only if not scheduler-only)
-if (!schedulerOnly) {
+// Start engines (only when engines are enabled)
+if (enginesEnabled) {
     await engineQueueManager.startEngines();
 }
