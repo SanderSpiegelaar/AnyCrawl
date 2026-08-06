@@ -21,6 +21,7 @@ import {
 } from "@anycrawl/db";
 import { TemplateHandler } from "../../utils/templateHandler.js";
 import { LegacyRunAdapter } from "../../services/LegacyRunAdapter.js";
+import { OrchestratedRunAdapter } from "../../services/OrchestratedRunAdapter.js";
 import { serializeRecords } from "../../utils/serializer.js";
 import { encodeCursor, decodeCursor, InvalidCursorError, type Cursor } from "../../utils/cursor.js";
 
@@ -63,12 +64,14 @@ const runCreateSchema = z
  *
  * `create` never re-implements variable merging, validation, handlers or billing:
  * it freezes the current revision, snapshots the input, persists a `template_runs`
- * row, then drives the LegacyRunAdapter (which delegates to the existing
- * scrape/search/crawl controllers). `runtime.mode="orchestrated"` templates are
- * rejected 501 until Phase 4 — no lingering run is created (see `create`).
+ * row, then dispatches: legacy `runtime.mode="single"` templates drive the
+ * LegacyRunAdapter (delegating to the existing scrape/search/crawl controllers),
+ * while `runtime.mode="orchestrated"` templates drive the OrchestratedRunAdapter
+ * (enqueuing onto the `template-run` worker queue).
  */
 export class TemplateRunController {
     private readonly adapter = new LegacyRunAdapter();
+    private readonly orchestratedAdapter = new OrchestratedRunAdapter();
 
     // --- Create --------------------------------------------------------------
 
@@ -92,16 +95,9 @@ export class TemplateRunController {
                 return;
             }
 
-            // Orchestrated runtime is Phase 4. Reject BEFORE creating any row so no
-            // lingering/failed run is left behind (choice: fail-fast, no side effects).
-            if ((template as any).runtime?.mode === "orchestrated") {
-                res.status(501).json({
-                    success: false,
-                    error: "not_implemented",
-                    message: "orchestrated runs land in Phase 4",
-                });
-                return;
-            }
+            // Orchestrated runs (design §7) enqueue onto the dedicated template-run
+            // worker instead of the legacy chain; single runs keep the legacy path.
+            const isOrchestrated = (template as any).runtime?.mode === "orchestrated";
 
             const type = template.templateType; // "scrape" | "crawl" | "search"
             if (type !== "scrape" && type !== "crawl" && type !== "search") {
@@ -138,12 +134,18 @@ export class TemplateRunController {
 
             // Pre-flight validation: merge variables + domain/keyword restrictions.
             // Throws on invalid variables / disallowed URL — mapped to 400 below.
+            // The merged result also yields the defaulted variables the orchestrated
+            // seed/page handlers consume (the legacy path re-merges downstream, so it
+            // only uses this call for validation).
+            let mergedVariables: Record<string, any> = (body.variables as Record<string, any>) ?? {};
             try {
-                await TemplateHandler.mergeRequestWithTemplate(
+                const merged = await TemplateHandler.mergeRequestWithTemplate(
                     { ...delegatedBody },
                     type,
                     this.currentUserId(req)
                 );
+                const mv = (merged as any)?.variables;
+                if (mv && typeof mv === "object") mergedVariables = mv as Record<string, any>;
             } catch (mergeError) {
                 this.mergeValidationError(res, mergeError);
                 return;
@@ -191,7 +193,7 @@ export class TemplateRunController {
                 userId: owner.userId ?? null,
                 templateUuid: template.uuid,
                 templateRevisionUuid: revision?.uuid ?? null,
-                mode: "single",
+                mode: isOrchestrated ? "orchestrated" : "single",
                 status: "queued",
                 idempotencyScopeHash,
                 inputSnapshot,
@@ -201,6 +203,31 @@ export class TemplateRunController {
 
             if (!run) {
                 this.internalError(res, new Error("Failed to create template run"));
+                return;
+            }
+
+            // Orchestrated dispatch: resolve the dataset destination + engine and
+            // enqueue onto the template-run worker → running (202). Any failure after
+            // the row exists finalizes the run failed (never left queued).
+            if (isOrchestrated) {
+                const outcome = await this.orchestratedAdapter.startOrchestratedRun({
+                    run,
+                    template,
+                    revision,
+                    variables: mergedVariables,
+                    runOptions: (body.run_options as Record<string, unknown>) ?? null,
+                    rawOutput: body.output,
+                    req,
+                });
+                const finalRun = (await getTemplateRun(run.uuid)) ?? run;
+                const httpStatus = outcome.ok ? 202 : outcome.httpStatus || 500;
+                res.status(httpStatus).json({
+                    success: outcome.ok,
+                    data: this.formatRun(finalRun, ref, template.templateId, {
+                        dataset_id: outcome.datasetId ?? finalRun.datasetId ?? null,
+                    }),
+                    ...(outcome.ok ? {} : { error: outcome.errorBody?.error ?? "dispatch_failed" }),
+                });
                 return;
             }
 

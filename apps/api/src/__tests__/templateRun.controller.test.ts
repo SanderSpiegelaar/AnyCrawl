@@ -16,6 +16,22 @@ const getJob = jest.fn<(id: string) => Promise<any>>();
 const getDB = jest.fn(async () => ({}));
 const computeDocumentHash = jest.fn((v: unknown) => `hash:${JSON.stringify(v)}`);
 
+// Orchestrated dispatch collaborators (exercised through the real OrchestratedRunAdapter).
+const appendTemplateRunEvent = jest.fn<(id: string, t: string, p?: any) => Promise<any>>(async () => ({}));
+const updateTemplateRunStatus = jest.fn<(id: string, patch: any) => Promise<any>>(async () => ({}));
+const parseDatasetOutput = jest.fn<(raw: unknown, opts: any) => any>(() => null);
+const assertDatasetWritable = jest.fn<(params: any) => Promise<void>>(async () => {});
+class DatasetWriteError extends Error {
+    code: string;
+    httpStatus: number;
+    constructor(code: string, message: string, httpStatus: number) {
+        super(message);
+        this.code = code;
+        this.httpStatus = httpStatus;
+    }
+}
+const addTemplateRunJob = jest.fn<(payload: any) => Promise<string>>(async () => "bull-job-1");
+
 const hasTemplateAccess = jest.fn<(template: any, userId?: string) => boolean>();
 const mergeRequestWithTemplate = jest.fn<(body: any, type: string, uid?: string) => Promise<any>>();
 
@@ -38,8 +54,17 @@ jest.unstable_mockModule("@anycrawl/db", () => ({
     getJob,
     getDB,
     computeDocumentHash,
+    appendTemplateRunEvent,
+    updateTemplateRunStatus,
+    parseDatasetOutput,
+    assertDatasetWritable,
+    DatasetWriteError,
     STATUS: { PENDING: "pending", COMPLETED: "completed", FAILED: "failed", CANCELLED: "cancelled" },
     TEMPLATE_RUN_TERMINAL_STATUSES: ["completed", "partial", "failed", "cancelled"],
+}));
+
+jest.unstable_mockModule("@anycrawl/scrape", () => ({
+    QueueManager: { getInstance: () => ({ addTemplateRunJob }) },
 }));
 
 jest.unstable_mockModule("../utils/templateHandler.js", () => ({
@@ -93,7 +118,19 @@ const scrapeTemplate = {
 };
 const searchTemplate = { ...scrapeTemplate, templateType: "search" };
 const crawlTemplate = { ...scrapeTemplate, templateType: "crawl" };
-const orchestratedTemplate = { ...scrapeTemplate, runtime: { mode: "orchestrated" } };
+const orchestratedTemplate = {
+    ...scrapeTemplate,
+    runtime: { mode: "orchestrated" },
+    reqOptions: { engine: "cheerio" },
+    outputSchema: {
+        name: "craigslist_listing",
+        version: "1.0.0",
+        itemsPath: "/items",
+        itemKeyPath: "/itemKey",
+        hashExcludePaths: ["/provenance/scrapedAt"],
+        projections: [{ field: "id", path: "/id", type: "string" }],
+    },
+};
 
 const queuedRun = {
     uuid: "run-uuid-1",
@@ -136,16 +173,102 @@ describe("TemplateRunController.create", () => {
         expect(createTemplateRun).not.toHaveBeenCalled();
     });
 
-    it("returns 501 for orchestrated templates without creating a run", async () => {
+    it("dispatches an orchestrated run to the template-run worker and returns running (202)", async () => {
         resolveTemplateByRef.mockResolvedValue(orchestratedTemplate);
-        const res = mockRes();
-        await new TemplateRunController().create(mockReq("content-extractor", { url: "https://x.com" }), res);
+        createTemplateRun.mockResolvedValue({ ...queuedRun, mode: "orchestrated" });
+        getTemplateRun.mockResolvedValue({
+            ...queuedRun,
+            mode: "orchestrated",
+            status: "running",
+            legacyJobUuid: "bull-job-1",
+        });
 
-        expect(res.statusCode).toBe(501);
-        expect(res.body.error).toBe("not_implemented");
-        expect(res.body.message).toBe("orchestrated runs land in Phase 4");
-        expect(createTemplateRun).not.toHaveBeenCalled();
-        expect(freezeCurrentTemplateRevision).not.toHaveBeenCalled();
+        const res = mockRes();
+        await new TemplateRunController().create(
+            mockReq("content-extractor", { variables: { cities: ["sfbay"] } }),
+            res
+        );
+
+        // A run is created in orchestrated mode, then enqueued (never run inline).
+        expect(freezeCurrentTemplateRevision).toHaveBeenCalledTimes(1);
+        expect(createTemplateRun).toHaveBeenCalledTimes(1);
+        expect((createTemplateRun.mock.calls[0]![0] as any).mode).toBe("orchestrated");
+        expect(executeSingleRun).not.toHaveBeenCalled();
+        expect(startCrawlRun).not.toHaveBeenCalled();
+
+        // The template-run job carries the run id, frozen revision, engine + mapping.
+        expect(addTemplateRunJob).toHaveBeenCalledTimes(1);
+        const payload = addTemplateRunJob.mock.calls[0]![0] as any;
+        expect(payload.type).toBe("template-run");
+        expect(payload.runId).toBe("run-uuid-1");
+        expect(payload.templateRevisionId).toBe("rev-1");
+        expect(payload.templateUuid).toBe("tpl-uuid-1");
+        expect(payload.engine).toBe("cheerio");
+        expect(payload.variables).toEqual({ cities: ["sfbay"] });
+        expect(payload.dataset.mapping.name).toBe("craigslist_listing");
+        expect(payload.dataset.mapping.projections[0]).toEqual({ name: "id", path: "/id", type: "string" });
+        expect(payload.dataset.create.name).toBe("craigslist_listing");
+
+        // Run is moved to running and the response is 202.
+        expect(updateTemplateRunStatus).toHaveBeenCalledWith(
+            "run-uuid-1",
+            expect.objectContaining({ status: "running", legacyJobUuid: "bull-job-1" })
+        );
+        expect(res.statusCode).toBe(202);
+        expect(res.body.success).toBe(true);
+        expect(res.body.data.status).toBe("running");
+        expect(res.body.data.legacy_job_id).toBe("bull-job-1");
+    });
+
+    it("fails an orchestrated run 400 when the template declares no outputSchema", async () => {
+        resolveTemplateByRef.mockResolvedValue({ ...orchestratedTemplate, outputSchema: undefined });
+        createTemplateRun.mockResolvedValue({ ...queuedRun, mode: "orchestrated" });
+        getTemplateRun.mockResolvedValue({ ...queuedRun, mode: "orchestrated", status: "failed" });
+
+        const res = mockRes();
+        await new TemplateRunController().create(
+            mockReq("content-extractor", { variables: { cities: ["sfbay"] } }),
+            res
+        );
+
+        // Row is created, then finalized failed — never enqueued, never left queued.
+        expect(createTemplateRun).toHaveBeenCalledTimes(1);
+        expect(addTemplateRunJob).not.toHaveBeenCalled();
+        expect(finalizeTemplateRun).toHaveBeenCalledWith(
+            "run-uuid-1",
+            "failed",
+            expect.objectContaining({ errorCode: "output_schema_required" })
+        );
+        expect(res.statusCode).toBe(400);
+        expect(res.body.error).toBe("output_schema_required");
+    });
+
+    it("propagates a 409 dataset schema mismatch from the orchestrated dispatch", async () => {
+        resolveTemplateByRef.mockResolvedValue(orchestratedTemplate);
+        createTemplateRun.mockResolvedValue({ ...queuedRun, mode: "orchestrated" });
+        getTemplateRun.mockResolvedValue({ ...queuedRun, mode: "orchestrated", status: "failed" });
+        parseDatasetOutput.mockReturnValueOnce({ return: "items", dataset: { datasetId: "ds-existing" } });
+        assertDatasetWritable.mockRejectedValueOnce(
+            new DatasetWriteError("dataset_schema_mismatch", "schema mismatch", 409)
+        );
+
+        const res = mockRes();
+        await new TemplateRunController().create(
+            mockReq("content-extractor", {
+                variables: { cities: ["sfbay"] },
+                output: { dataset: { dataset_id: "ds-existing" } },
+            }),
+            res
+        );
+
+        expect(addTemplateRunJob).not.toHaveBeenCalled();
+        expect(finalizeTemplateRun).toHaveBeenCalledWith(
+            "run-uuid-1",
+            "failed",
+            expect.objectContaining({ errorCode: "dataset_schema_mismatch" })
+        );
+        expect(res.statusCode).toBe(409);
+        expect(res.body.error).toBe("dataset_schema_mismatch");
     });
 
     it("runs a single scrape via the adapter and returns the terminal run (201)", async () => {
