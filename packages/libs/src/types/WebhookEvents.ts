@@ -122,6 +122,8 @@ export interface MonitorEventPayload {
     diff_text?: string;
     diff_json?: MonitorFieldDiff[];
     judgment?: { meaningful: boolean; confidence: string; reason: string };
+    // Present on monitor.error events only
+    error?: { message: string; code?: string };
     captured_at: string;
 }
 

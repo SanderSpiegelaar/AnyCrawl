@@ -276,14 +276,20 @@ async function runJob(job: Job) {
                         await runJob(job);
                     });
 
-                    // Add event listeners for scheduled task executions
-                    worker.on('completed', async (job: Job) => {
-                        if (job.data.scheduled_execution_id) {
-                            await updateExecutionStatus(job.data.scheduled_execution_id, 'completed', job);
-                        }
-                    });
-
+                    // NOTE: BullMQ 'completed' fires when runJob resolves, which is the
+                    // moment the URL is handed to the crawler's request queue — NOT when
+                    // the page has actually been scraped. Scheduled scrape executions are
+                    // therefore finalized at real scrape completion/failure inside
+                    // engines/Base.ts (markCompleted / handleFailedRequest), never here.
+                    // Finalizing here ran the monitor post-processor before job_results
+                    // existed, so monitors could never produce a snapshot.
                     worker.on('failed', async (job: Job | undefined, error: Error) => {
+                        // Only queue-level failures (runJob threw before handoff) land here.
+                        // BullMQ emits 'failed' on EVERY attempt; jobs are dispatched with
+                        // attempts: 3, so finalize only when no retries remain — otherwise a
+                        // transient first-attempt failure permanently fails the execution
+                        // while the retry then succeeds (and bills).
+                        if (job && (job.attemptsMade ?? 0) < (job.opts?.attempts ?? 1)) return;
                         if (job?.data.scheduled_execution_id) {
                             await updateExecutionStatus(job.data.scheduled_execution_id, 'failed', job, error);
                         }
@@ -310,14 +316,21 @@ async function runJob(job: Job) {
                         await runJob(job);
                     });
 
-                    // Add event listeners for scheduled task executions
-                    worker.on('completed', async (job: Job) => {
-                        if (job.data.scheduled_execution_id) {
-                            await updateExecutionStatus(job.data.scheduled_execution_id, 'completed', job);
-                        }
-                    });
-
+                    // NOTE: BullMQ 'completed' fires when runJob resolves, which is the
+                    // moment the seed URL is handed to the crawler's request queue — NOT
+                    // when the crawl has actually finished. Scheduled crawl executions
+                    // are therefore finalized at real crawl completion inside
+                    // managers/Progress.ts (tryFinalize's winner branch), never here.
+                    // Finalizing here marked executions completed while the crawl was
+                    // still running, so success/failure stats were wrong and monitor
+                    // post-processing ran before results existed.
                     worker.on('failed', async (job: Job | undefined, error: Error) => {
+                        // Only queue-level failures (runJob threw before handoff) land here.
+                        // BullMQ emits 'failed' on EVERY attempt; jobs are dispatched with
+                        // attempts: 3, so finalize only when no retries remain — otherwise a
+                        // transient first-attempt failure permanently fails the execution
+                        // while the retry then succeeds (and bills).
+                        if (job && (job.attemptsMade ?? 0) < (job.opts?.attempts ?? 1)) return;
                         if (job?.data.scheduled_execution_id) {
                             await updateExecutionStatus(job.data.scheduled_execution_id, 'failed', job, error);
                         }

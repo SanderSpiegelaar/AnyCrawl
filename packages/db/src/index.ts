@@ -19,6 +19,7 @@ import {
     getMonitorByScheduledTask as getMonitorByScheduledTaskFn,
     getLatestSnapshot as getLatestSnapshotFn,
     listSnapshotsByMonitor as listSnapshotsByMonitorFn,
+    getSnapshotForMonitor as getSnapshotForMonitorFn,
     listChangesByMonitor as listChangesByMonitorFn,
 } from "./model/MonitorAccess.js";
 import {
@@ -102,6 +103,7 @@ export const listMonitorsByOwner = listMonitorsByOwnerOwner;
 export const getMonitorByScheduledTask = getMonitorByScheduledTaskFn;
 export const getLatestSnapshot = getLatestSnapshotFn;
 export const listSnapshotsByMonitor = listSnapshotsByMonitorFn;
+export const getSnapshotForMonitor = getSnapshotForMonitorFn;
 export const listChangesByMonitor = listChangesByMonitorFn;
 
 // Dataset ownership + access helpers

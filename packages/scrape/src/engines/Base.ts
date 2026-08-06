@@ -317,6 +317,26 @@ export abstract class BaseEngine {
                 await failedJob(jobId, error.message, false, { total: 1, completed: 0, failed: 1 });
                 await BandwidthManager.getInstance().flushJob(jobId);
             } catch { }
+
+            // Finalize the scheduled execution as failed at the real failure point
+            // (HTTP error page or retries exhausted). Mirrors the completed-path
+            // finalize in the request handler; see Worker.ts for why this cannot
+            // live in the BullMQ event handlers.
+            const scheduledExecutionId = context.request.userData.scheduled_execution_id;
+            if (scheduledExecutionId) {
+                try {
+                    const { finalizeExecution } = await import("../managers/ExecutionLifecycle.js");
+                    await finalizeExecution({
+                        executionUuid: scheduledExecutionId,
+                        status: "failed",
+                        errorMessage: error.message,
+                        errorCode: "SCRAPE_FAILED",
+                        source: "worker",
+                    });
+                } catch (finalizeError) {
+                    log.warning(`[${queueName}] [${jobId}] Failed to finalize scheduled execution ${scheduledExecutionId}: ${finalizeError}`);
+                }
+            }
         }
 
         log.error(`[${queueName}] [${jobId}] ${error.message} (${error.type})`);
@@ -352,6 +372,27 @@ export abstract class BaseEngine {
                 await failedJob(jobId, error.message, false, { total: 1, completed: 0, failed: 1 });
                 await BandwidthManager.getInstance().flushJob(jobId);
             } catch { }
+
+            // Extraction failure is a terminal outcome for the scrape — finalize
+            // the scheduled execution here too. Without this, the ExtractionError
+            // branch returns before both other finalize sites (persist branch and
+            // handleFailedRequest), leaving the execution 'running' until the
+            // janitor reaps it 30 minutes later as a generic timeout.
+            const scheduledExecutionId = context.request.userData.scheduled_execution_id;
+            if (scheduledExecutionId) {
+                try {
+                    const { finalizeExecution } = await import("../managers/ExecutionLifecycle.js");
+                    await finalizeExecution({
+                        executionUuid: scheduledExecutionId,
+                        status: "failed",
+                        errorMessage: error.message,
+                        errorCode: "EXTRACTION_FAILED",
+                        source: "worker",
+                    });
+                } catch (finalizeError) {
+                    log.warning(`[${queueName}] [${jobId}] Failed to finalize scheduled execution ${scheduledExecutionId}: ${finalizeError}`);
+                }
+            }
         }
 
         log.error(`[${queueName}] [${jobId}] ${error.message} (${error.type})`);
@@ -1417,6 +1458,24 @@ export abstract class BaseEngine {
                         await completedJob(jobId, true, { total: 1, completed: 1, failed: 0 });
                         await BandwidthManager.getInstance().flushJob(jobId);
                     } catch { }
+
+                    // Finalize the scheduled execution HERE — at real scrape completion,
+                    // after the job result row exists — not when the queue job merely
+                    // handed the URL to the crawler (see Worker.ts). This is what allows
+                    // the monitor post-processor to see job_results and write snapshots.
+                    const scheduledExecutionId = context.request.userData.scheduled_execution_id;
+                    if (scheduledExecutionId) {
+                        try {
+                            const { finalizeExecution } = await import("../managers/ExecutionLifecycle.js");
+                            await finalizeExecution({
+                                executionUuid: scheduledExecutionId,
+                                status: "completed",
+                                source: "worker",
+                            });
+                        } catch (finalizeError) {
+                            log.warning(`[${queueName}] [${jobId}] Failed to finalize scheduled execution ${scheduledExecutionId}: ${finalizeError}`);
+                        }
+                    }
                 }
                 // For crawl jobs: mark page done and try finalize
                 if (context.request.userData.type === JOB_TYPE_CRAWL) {

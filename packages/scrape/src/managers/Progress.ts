@@ -4,6 +4,7 @@ import { completedJob, failedJob, getDB, getJob, schemas, eq, sql, Billing } fro
 import { log, CreditCalculator, WebhookEventType, appConfig, config } from "@anycrawl/libs";
 import type { QueueName } from "./Queue.js";
 import { BandwidthManager } from "./Bandwidth.js";
+import { finalizeExecution } from "./ExecutionLifecycle.js";
 
 const REDIS_FIELDS = {
     ENQUEUED: "enqueued",
@@ -394,6 +395,12 @@ export class ProgressManager {
                 log.warning(`[PROGRESS] Failed to update job status in DB for job ${jobId}: ${error}`);
             }
 
+            // Finalize the scheduled task execution (if this crawl belongs to one)
+            // HERE — at the real terminal point of the crawl — not when the BullMQ
+            // queue job merely handed the seed URL to the crawler (see Worker.ts).
+            // Never allowed to break crawl finalization; errors are swallowed inside.
+            await this.finalizeScheduledExecution(jobId, job, succeeded);
+
             // Trigger webhook event for crawl completion/failure
             try {
                 const dbJob = await getJob(jobId);
@@ -428,6 +435,76 @@ export class ProgressManager {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Finalize the scheduled task execution tied to this crawl, if any.
+     * Called only from tryFinalize's winner branch — the single point where a
+     * crawl reaches its terminal state (the Lua guard ensures exactly one caller
+     * gets here). BullMQ's 'completed' event fires at URL handoff (see Worker.ts),
+     * so scheduled crawl executions must be finalized here instead.
+     *
+     * Execution resolution:
+     *  1) scheduled_execution_id from the BullMQ job data (set by the scheduler at dispatch)
+     *  2) DB fallback when the BullMQ job has already been removed
+     *     (removeOnComplete age): jobs.jobId -> jobs.uuid -> task_executions.jobUuid
+     *
+     * Non-scheduled crawls are skipped silently (no DB lookup when the BullMQ job
+     * exists without a scheduled_execution_id). finalizeExecution is idempotent
+     * (only transitions pending/running once), so racing the scheduler janitor is safe.
+     */
+    private async finalizeScheduledExecution(
+        jobId: string,
+        bullJob: { data?: any } | null | undefined,
+        succeeded: number
+    ): Promise<void> {
+        try {
+            let executionUuid: string | undefined = bullJob?.data?.scheduled_execution_id;
+            if (!executionUuid) {
+                if (bullJob) {
+                    // BullMQ job exists and carries no scheduled_execution_id:
+                    // this crawl was not dispatched by the scheduler — nothing to do.
+                    return;
+                }
+                // BullMQ job already evicted — resolve the execution via DB.
+                const db = await getDB();
+                const [jobRow] = await db
+                    .select({ uuid: schemas.jobs.uuid, origin: schemas.jobs.origin })
+                    .from(schemas.jobs)
+                    .where(eq(schemas.jobs.jobId, jobId))
+                    .limit(1);
+                if (!jobRow || jobRow.origin !== "scheduled-task") {
+                    return;
+                }
+                const [execRow] = await db
+                    .select({ uuid: schemas.taskExecutions.uuid })
+                    .from(schemas.taskExecutions)
+                    .where(eq(schemas.taskExecutions.jobUuid, jobRow.uuid))
+                    .limit(1);
+                if (!execRow?.uuid) {
+                    return;
+                }
+                executionUuid = execRow.uuid as string;
+            }
+
+            if (succeeded === 0) {
+                await finalizeExecution({
+                    executionUuid,
+                    status: "failed",
+                    errorMessage: "No pages were successfully processed",
+                    errorCode: "CRAWL_FAILED",
+                    source: "worker",
+                });
+            } else {
+                await finalizeExecution({
+                    executionUuid,
+                    status: "completed",
+                    source: "worker",
+                });
+            }
+        } catch (error) {
+            log.warning(`[PROGRESS] Failed to finalize scheduled execution for job ${jobId}: ${error}`);
+        }
     }
 
     /**

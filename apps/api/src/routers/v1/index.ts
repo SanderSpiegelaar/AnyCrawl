@@ -81,6 +81,7 @@ router.post("/monitors/:id/pause", controllerWrapper(monitorController.pause));
 router.post("/monitors/:id/resume", controllerWrapper(monitorController.resume));
 router.post("/monitors/:id/check", controllerWrapper(monitorController.check));
 router.get("/monitors/:id/snapshots", controllerWrapper(monitorController.snapshots));
+router.get("/monitors/:id/snapshots/:snapshotId", controllerWrapper(monitorController.snapshotDetail));
 router.get("/monitors/:id/changes", controllerWrapper(monitorController.changes));
 router.get("/monitors/:id/changes/:changeId", controllerWrapper(monitorController.changeDetail));
 

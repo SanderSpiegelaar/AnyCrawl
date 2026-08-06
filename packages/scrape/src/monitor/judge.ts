@@ -26,8 +26,6 @@ export async function judgeChange(
     diffText: string,
     url: string
 ): Promise<JudgmentResult> {
-    const modelId = getExtractModelId();
-
     const systemPrompt = `You are a change-detection judge. Your only job is to decide whether an observed diff on a web page is meaningful relative to the stated monitoring goal.
 
 Ignore mechanical noise such as rotating tokens, session IDs, footer timestamps, ad slots, or cache-buster query strings.
@@ -44,6 +42,9 @@ ${diffText.slice(0, 3000)}
 Is this change meaningful relative to the goal?`;
 
     try {
+        // Inside the try: with no LLM provider configured this throws, and the
+        // degraded-mode fallback below must still apply (see docstring).
+        const modelId = getExtractModelId();
         const generateObjectFn = generateObject as any;
         const { object } = await generateObjectFn({
             model: getLLM(modelId),

@@ -199,7 +199,7 @@ Track a product price every 15 minutes with structured extraction:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `only_main_content` | boolean | `true` | Strip navigation and boilerplate before diffing |
-| `ignore_selectors` | string[] | - | CSS selectors to exclude from comparison |
+| `ignore_selectors` | string[] | - | Substring filters — any line of the normalized text containing one of these strings is excluded from comparison (matched against text, not the DOM) |
 | `min_change_ratio` | number | - | Minimum normalized change ratio (0–1) to treat as changed |
 
 ### Notification Options

@@ -61,6 +61,62 @@ export class MonitorPostProcessor {
         }
     }
 
+    /**
+     * Called by finalizeExecution() on the failed branch. Records an 'error'
+     * snapshot so failed checks are visible in the monitor detail, and emits a
+     * monitor.error webhook event. Never throws.
+     */
+    public static async processFailure(input: PostProcessInput & {
+        errorMessage?: string;
+        errorCode?: string;
+    }): Promise<void> {
+        try {
+            const db = input.db || await getDB();
+            const monitor = await getMonitorByScheduledTask(db, input.scheduledTaskUuid);
+            if (!monitor) return;
+
+            const url: string = (monitor.targets as any)?.[0]?.url ?? "";
+            await db.insert(schemas.monitorSnapshots).values({
+                uuid: randomUUID(),
+                monitorUuid: monitor.uuid,
+                taskExecutionUuid: input.executionUuid,
+                url,
+                contentHash: "",
+                content: input.errorMessage ?? null,
+                extracted: null,
+                status: "error",
+                capturedAt: new Date(),
+            });
+
+            if (config.webhooks.enabled) {
+                const payload: MonitorEventPayload = {
+                    monitor_id: monitor.uuid,
+                    monitor_name: monitor.name,
+                    monitor_type: monitor.monitorType,
+                    url,
+                    error: {
+                        message: input.errorMessage ?? "Check failed",
+                        code: input.errorCode,
+                    },
+                    captured_at: new Date().toISOString(),
+                };
+                try {
+                    await WebhookManager.getInstance().triggerEvent(
+                        WebhookEventType.MONITOR_ERROR,
+                        payload,
+                        "monitor",
+                        monitor.uuid,
+                        monitor.userId ?? undefined
+                    );
+                } catch (err) {
+                    log.warning(`[MONITOR] monitor.error webhook failed: ${err}`);
+                }
+            }
+        } catch (err) {
+            log.warning(`[MONITOR] processFailure uncaught error for execution ${input.executionUuid}: ${err}`);
+        }
+    }
+
     private static async _process(input: PostProcessInput): Promise<void> {
         const db = input.db || await getDB();
 
@@ -116,6 +172,8 @@ export class MonitorPostProcessor {
         const trackMode: string = monitor.trackMode ?? "text";
 
         const changes: UrlChange[] = [];
+        // Snapshot-status tally for the check-completed summary (per URL).
+        const counters = { new: 0, same: 0, changed: 0, error: 0 };
 
         // 5. Process each URL result.
         for (const result of results) {
@@ -129,6 +187,7 @@ export class MonitorPostProcessor {
                     trackMode,
                     onlyMeaningful,
                     changes,
+                    counters,
                 });
             } catch (err) {
                 log.warning(`[MONITOR] Error processing result url=${result.url}: ${err}`);
@@ -137,10 +196,10 @@ export class MonitorPostProcessor {
 
         // 6. Notify.
         if (changes.length > 0) {
-            await MonitorPostProcessor._notify(monitor, changes, results.length, notifyOptions);
+            await MonitorPostProcessor._notify(monitor, changes, results.length, notifyOptions, counters);
         } else {
             // Fire a "check completed, no changes" summary when webhooks are enabled.
-            await MonitorPostProcessor._notifyCheckCompleted(monitor, results.length, 0);
+            await MonitorPostProcessor._notifyCheckCompleted(monitor, results.length, 0, counters);
         }
     }
 
@@ -153,11 +212,32 @@ export class MonitorPostProcessor {
         trackMode: string;
         onlyMeaningful: boolean;
         changes: UrlChange[];
+        counters: { new: number; same: number; changed: number; error: number };
     }): Promise<void> {
-        const { db, monitor, executionUuid, result, diffOptions, trackMode, onlyMeaningful, changes } = params;
+        const { db, monitor, executionUuid, result, diffOptions, trackMode, onlyMeaningful, changes, counters } = params;
 
         const url: string = result.url;
         const data: Record<string, any> = result.data ?? {};
+
+        // Failed page results (HTTP error / bot-block interstitials) must not be
+        // diffed as content — that would raise a false "changed" alert now and a
+        // second false alert when the page recovers. Record an error snapshot so
+        // the failed check stays visible, then stop.
+        if (result.status === "failed") {
+            await db.insert(schemas.monitorSnapshots).values({
+                uuid: randomUUID(),
+                monitorUuid: monitor.uuid,
+                taskExecutionUuid: executionUuid,
+                url,
+                contentHash: "",
+                content: null,
+                extracted: null,
+                status: "error",
+                capturedAt: new Date(),
+            });
+            counters.error++;
+            return;
+        }
 
         // 5a. Normalize + hash current content.
         const normalizeOpts = {
@@ -208,6 +288,28 @@ export class MonitorPostProcessor {
             snapshotStatus = "changed";
         }
 
+        // 5d'. Extraction-failure guard (json/mixed): when the previous snapshot
+        // holds extracted data but this run produced none — the fallback LLM
+        // extraction threw, OR extraction "succeeded" with an empty/all-null
+        // payload ({}, null, or the schema skeleton with every field null),
+        // which the extractor returns without throwing — diffing prev vs that
+        // would read as "every field removed": a false alert now and a false
+        // "re-added" alert when extraction recovers. Write the snapshot as
+        // 'error' directly (getLatestSnapshot skips error rows, preserving the
+        // healthy baseline) and skip diffing entirely. Applies regardless of
+        // whether extraction came from data.json or the extractSchema fallback.
+        const extractionFailed =
+            (trackMode === "json" || trackMode === "mixed") &&
+            !hasExtractedData(extracted) &&
+            hasExtractedData(prevSnapshot?.extracted);
+
+        if (extractionFailed) {
+            snapshotStatus = "error";
+            log.warning(
+                `[MONITOR] Extraction produced no data for url=${url} but the previous snapshot has extracted fields — recording an error snapshot and skipping the diff to avoid a false "removed" alert`
+            );
+        }
+
         // 5e. Write the snapshot.
         const snapshotUuid = randomUUID();
         await db.insert(schemas.monitorSnapshots).values({
@@ -222,6 +324,13 @@ export class MonitorPostProcessor {
             capturedAt: new Date(),
         });
 
+        if (snapshotStatus === "new") counters.new++;
+        else if (snapshotStatus === "same") counters.same++;
+        else if (snapshotStatus === "error") counters.error++;
+        else counters.changed++;
+
+        if (extractionFailed) return;
+
         // 5f. Skip diff for new/same — baseline is established on first run.
         if (snapshotStatus !== "changed") return;
 
@@ -229,42 +338,96 @@ export class MonitorPostProcessor {
         let diffText: string | undefined;
         let diffJson: any[] | undefined;
         let changeType = "content";
+        // Whether the truncated-text comparison found a diff (text/mixed modes).
+        let textChanged = false;
 
         if (trackMode === "text" || trackMode === "mixed") {
             const prevNormalized = prevSnapshot.content ?? "";
             // Diff truncated-vs-truncated: prevSnapshot.content was stored truncated, so
             // compare against the truncated current content for a like-for-like diff.
             const tdResult = textDiff(prevNormalized, storedContent);
-            diffText = tdResult.diffText;
-            if (!tdResult.changed) {
+            // diff_options.min_change_ratio: ignore edits below this fraction of
+            // changed lines (0–1). A sub-ratio change is treated exactly like an
+            // unchanged text comparison.
+            const minRatio =
+                typeof diffOptions.min_change_ratio === "number" ? diffOptions.min_change_ratio : 0;
+            textChanged = tdResult.changed && (minRatio === 0 || tdResult.ratio >= minRatio);
+            if (textChanged) {
+                diffText = tdResult.diffText;
+            } else if (trackMode === "text") {
                 // Content normalized to same string after re-computation: no meaningful diff
                 await db.update(schemas.monitorSnapshots)
                     .set({ status: "same" })
                     .where(eq(schemas.monitorSnapshots.uuid, snapshotUuid));
+                counters.changed--;
+                counters.same++;
                 return;
             }
+            // Mixed mode: an identical truncated text does NOT mean nothing
+            // changed — the hash covers the full content (beyond the 256KB
+            // truncation boundary) and the json payload may differ. Leave
+            // diffText unset and fall through to the json diff; we only
+            // downgrade to "same" when that also finds nothing (below).
         }
 
         if (trackMode === "json" || trackMode === "mixed") {
             const prevExtracted = prevSnapshot.extracted ?? {};
             const currExtracted = extracted ?? {};
-            const fieldDiffs = priceDiff(prevExtracted, currExtracted);
+            // Shape drift (e.g. the extractor returned an array where the
+            // previous run returned an object): warn but still diff — priceDiff
+            // compares by key in that case (array indices become keys), which
+            // is noisy but safe and never throws.
+            if (
+                hasExtractedData(prevExtracted) &&
+                hasExtractedData(currExtracted) &&
+                (Array.isArray(prevExtracted) !== Array.isArray(currExtracted) ||
+                    typeof prevExtracted !== typeof currExtracted)
+            ) {
+                log.warning(
+                    `[MONITOR] Extracted shape drift for url=${url} (prev=${describeShape(prevExtracted)}, current=${describeShape(currExtracted)}) — diffing by keys`
+                );
+            }
+            let fieldDiffs: ReturnType<typeof priceDiff> = [];
+            try {
+                fieldDiffs = priceDiff(prevExtracted, currExtracted);
+            } catch (err) {
+                // Defensive: priceDiff handles mismatched shapes, but a diff
+                // failure must never take down the whole check.
+                log.warning(`[MONITOR] priceDiff failed for url=${url}: ${err} — treating as no field-level diff`);
+            }
             if (fieldDiffs.length > 0) {
-                diffJson = fieldDiffs;
                 const classified = classifyPriceChange(
                     fieldDiffs,
                     (monitor.notifyOptions as any)?.thresholds
                 );
-                if (classified) changeType = classified;
+                if (classified === null) {
+                    // Every field diff is a sub-threshold price move — suppressed per
+                    // thresholds.price_change_pct. Leave diffJson unset so json mode
+                    // downgrades to "same" below instead of raising a content alert.
+                    // Known limit: in mixed mode the same price string may still alert
+                    // through the TEXT channel — accepted, since text alerts are a
+                    // legitimate signal for mixed monitors.
+                } else {
+                    diffJson = fieldDiffs;
+                    changeType = classified;
+                }
             }
         }
 
         // In pure json (price) mode, a content-hash change with no field-level diff is
-        // noise (e.g. a footer date moved). Downgrade to "same" and skip the alert.
-        if (trackMode === "json" && (!diffJson || diffJson.length === 0)) {
+        // noise (e.g. a footer date moved). The same holds in mixed mode when BOTH the
+        // text diff and the field diff came back empty. Downgrade to "same" and skip
+        // the alert.
+        const jsonDiffEmpty = !diffJson || diffJson.length === 0;
+        if (
+            (trackMode === "json" && jsonDiffEmpty) ||
+            (trackMode === "mixed" && !textChanged && jsonDiffEmpty)
+        ) {
             await db.update(schemas.monitorSnapshots)
                 .set({ status: "same" })
                 .where(eq(schemas.monitorSnapshots.uuid, snapshotUuid));
+            counters.changed--;
+            counters.same++;
             return;
         }
 
@@ -310,13 +473,19 @@ export class MonitorPostProcessor {
         monitor: any,
         changes: UrlChange[],
         totalUrls: number,
-        notifyOptions: any
+        notifyOptions: any,
+        counters?: { new: number; same: number; changed: number; error: number }
     ): Promise<void> {
         const channels: string[] = notifyOptions.channels ?? ["webhook"];
         const userId: string | undefined = monitor.userId ?? undefined;
 
         const changedCount = changes.length;
-        const sameCount = totalUrls - changedCount;
+
+        // Track delivery per change — a change is only marked notified when its
+        // own webhook event was enqueued to ≥1 subscription, or the email digest
+        // (which contains all changes) was accepted. Silently-undelivered alerts
+        // stay visible (notified: false) instead of being falsely marked sent.
+        const deliveredUuids = new Set<string>();
 
         // Fire per-change webhook events
         if (channels.includes("webhook") && config.webhooks.enabled) {
@@ -339,13 +508,17 @@ export class MonitorPostProcessor {
                 };
 
                 try {
-                    await WebhookManager.getInstance().triggerEvent(
+                    // triggerEvent never rejects — it returns the number of
+                    // deliveries enqueued. 0 (no matching subscription or a
+                    // lookup failure) must NOT count as delivered.
+                    const enqueued = await WebhookManager.getInstance().triggerEvent(
                         eventType,
                         payload,
                         "monitor",
                         monitor.uuid,
                         userId
                     );
+                    if (enqueued > 0) deliveredUuids.add(change.snapshotUuid);
                 } catch (err) {
                     log.warning(`[MONITOR] Webhook triggerEvent failed: ${err}`);
                 }
@@ -353,24 +526,35 @@ export class MonitorPostProcessor {
         }
 
         // Fire check-completed summary event
-        await MonitorPostProcessor._notifyCheckCompleted(monitor, totalUrls, changedCount);
+        await MonitorPostProcessor._notifyCheckCompleted(monitor, totalUrls, changedCount, counters);
 
         // Email notification
         if (channels.includes("email") && config.email.enabled) {
             const recipients: string[] = notifyOptions.email_recipients ?? [];
             if (recipients.length > 0) {
                 try {
+                    // Contract: sendChangeEmail THROWS when nothing was
+                    // delivered and resolves otherwise. The digest carries all
+                    // changes, so success covers every change in this batch.
                     await EmailNotifier.sendChangeEmail(recipients, monitor, changes);
+                    for (const change of changes) deliveredUuids.add(change.snapshotUuid);
                 } catch (err) {
                     log.warning(`[MONITOR] Email notification failed: ${err}`);
                 }
             }
         }
 
-        // Mark changes as notified
+        // Mark only the changes that actually went out on some channel.
+        if (deliveredUuids.size === 0) {
+            log.warning(
+                `[MONITOR] No notification channel delivered for monitor ${monitor.uuid} — leaving ${changes.length} change(s) unnotified`
+            );
+            return;
+        }
         try {
             const db = await getDB();
             for (const change of changes) {
+                if (!deliveredUuids.has(change.snapshotUuid)) continue;
                 await db.update(schemas.monitorChanges)
                     .set({ notified: true })
                     .where(
@@ -386,7 +570,8 @@ export class MonitorPostProcessor {
     private static async _notifyCheckCompleted(
         monitor: any,
         totalUrls: number,
-        changedCount: number
+        changedCount: number,
+        counters?: { new: number; same: number; changed: number; error: number }
     ): Promise<void> {
         if (!config.webhooks.enabled) return;
         const payload: MonitorEventPayload = {
@@ -395,11 +580,13 @@ export class MonitorPostProcessor {
             monitor_type: monitor.monitorType,
             summary: {
                 total: totalUrls,
-                same: totalUrls - changedCount,
-                changed: changedCount,
-                new: 0,
+                // Real per-URL snapshot tallies; the arithmetic fallback covers
+                // callers that predate the counters param.
+                same: counters?.same ?? totalUrls - changedCount,
+                changed: counters?.changed ?? changedCount,
+                new: counters?.new ?? 0,
                 removed: 0,
-                error: 0,
+                error: counters?.error ?? 0,
             },
             captured_at: new Date().toISOString(),
         };
@@ -415,4 +602,25 @@ export class MonitorPostProcessor {
             log.warning(`[MONITOR] check-completed webhook failed: ${err}`);
         }
     }
+}
+
+/**
+ * True when an extracted payload holds actual data: at least one non-null leaf
+ * value. Catches the LLM extractor's no-data shapes — `{}`, `null`, and the
+ * schema-skeleton object with every field null (buildEmptyDataFromSchema) —
+ * which resolve without throwing and previously bypassed the
+ * extraction-failure guard, producing false "field removed" alerts.
+ */
+function hasExtractedData(extracted: any): boolean {
+    if (extracted === undefined || extracted === null) return false;
+    if (Array.isArray(extracted)) return extracted.some((item) => hasExtractedData(item));
+    if (typeof extracted === "object") {
+        return Object.values(extracted).some((value) => hasExtractedData(value));
+    }
+    return true;
+}
+
+/** Human-readable JS shape label for shape-drift warnings. */
+function describeShape(value: any): string {
+    return Array.isArray(value) ? "array" : typeof value;
 }
