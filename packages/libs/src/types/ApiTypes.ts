@@ -20,4 +20,7 @@ export interface RequestWithAuth extends Request {
     billingChargeDetails?: BillingChargeDetailsV1;
     checkCredits?: boolean;
     jobId?: string;
+    // Set by the template dedicated-endpoint dispatcher before delegating, so downstream
+    // billing (delta vs target) knows the real action without sniffing req.path.
+    resolvedTemplateType?: "scrape" | "crawl" | "search";
 }

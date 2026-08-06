@@ -18,6 +18,17 @@ export interface TextDiffResult {
 }
 
 /**
+ * Max lines (per side, after common prefix/suffix trimming) fed into the
+ * O(m×n) LCS table. 2000² × 8B ≈ 32MB transient — a 5000 cap would still admit
+ * ~200MB allocations inside the worker. Beyond this we fall back to a cheap
+ * positional summary diff.
+ */
+const MAX_LCS_LINES = 2000;
+
+/** Max differing lines rendered in the fallback summary diff. */
+const MAX_SUMMARY_DIFF_LINES = 50;
+
+/**
  * Produce a unified-diff-style text summary comparing two normalized content
  * strings. Context lines (unchanged) are included up to ±3 lines.
  */
@@ -26,19 +37,100 @@ export function textDiff(prev: string, next: string): TextDiffResult {
 
     const prevLines = prev.split("\n");
     const nextLines = next.split("\n");
+    const totalLines = Math.max(prevLines.length, nextLines.length, 1);
 
-    // Simple LCS-based line diff
-    const hunks = computeLineDiff(prevLines, nextLines);
+    // Trim common prefix/suffix lines before the LCS: identical lines add
+    // nothing to the diff (context lines are re-read from the full arrays at
+    // render time), and trimming keeps the O(m×n) table small for large
+    // snapshots that only changed locally.
+    const minLen = Math.min(prevLines.length, nextLines.length);
+    let trimStart = 0;
+    while (trimStart < minLen && prevLines[trimStart] === nextLines[trimStart]) {
+        trimStart++;
+    }
+    let trimEnd = 0;
+    while (
+        trimEnd < minLen - trimStart &&
+        prevLines[prevLines.length - 1 - trimEnd] === nextLines[nextLines.length - 1 - trimEnd]
+    ) {
+        trimEnd++;
+    }
+    const prevMid = prevLines.slice(trimStart, prevLines.length - trimEnd);
+    const nextMid = nextLines.slice(trimStart, nextLines.length - trimEnd);
+
+    // Guard against the O(m×n) memory blowup: when the differing region is
+    // still huge, emit a truncated positional summary instead of a full LCS.
+    if (prevMid.length > MAX_LCS_LINES || nextMid.length > MAX_LCS_LINES) {
+        return summaryDiff(prevMid, nextMid, trimStart, totalLines);
+    }
+
+    // Simple LCS-based line diff over the trimmed middle; shift hunk indices
+    // back so rendering uses original line numbers and full-array context.
+    const hunks = computeLineDiff(prevMid, nextMid);
+    for (const h of hunks) {
+        h.prevStart += trimStart;
+        h.nextStart += trimStart;
+    }
     const diffText = renderUnifiedDiff(hunks, prevLines, nextLines);
 
     const changedLines = hunks.reduce(
         (acc, h) => acc + Math.max(h.delCount, h.addCount),
         0
     );
-    const totalLines = Math.max(prevLines.length, nextLines.length, 1);
     const ratio = Math.min(changedLines / totalLines, 1);
 
     return { changed: true, diffText, ratio };
+}
+
+/**
+ * Cheap fallback diff for oversized inputs: positional line comparison of the
+ * (already prefix/suffix-trimmed) middle regions, rendered as a truncated
+ * unified-style hunk. Never allocates more than O(m+n).
+ */
+function summaryDiff(
+    prevMid: string[],
+    nextMid: string[],
+    trimStart: number,
+    totalLines: number
+): TextDiffResult {
+    const lines: string[] = [];
+    // Unified convention: an empty a-side uses the line BEFORE the insertion
+    // point (`-N,0`), not one past it.
+    const aStart = prevMid.length === 0 ? trimStart : trimStart + 1;
+    const bStart = nextMid.length === 0 ? trimStart : trimStart + 1;
+    lines.push(`@@ -${aStart},${prevMid.length} +${bStart},${nextMid.length} @@`);
+
+    const pairLen = Math.min(prevMid.length, nextMid.length);
+    let differing = 0;
+    let shown = 0;
+    for (let i = 0; i < pairLen; i++) {
+        if (prevMid[i] !== nextMid[i]) {
+            differing++;
+            if (shown < MAX_SUMMARY_DIFF_LINES) {
+                lines.push(`-${prevMid[i]}`);
+                lines.push(`+${nextMid[i]}`);
+                shown++;
+            }
+        }
+    }
+    for (let i = pairLen; i < prevMid.length; i++) {
+        differing++;
+        if (shown < MAX_SUMMARY_DIFF_LINES) {
+            lines.push(`-${prevMid[i]}`);
+            shown++;
+        }
+    }
+    for (let i = pairLen; i < nextMid.length; i++) {
+        differing++;
+        if (shown < MAX_SUMMARY_DIFF_LINES) {
+            lines.push(`+${nextMid[i]}`);
+            shown++;
+        }
+    }
+    lines.push(`... diff truncated (${prevMid.length}/${nextMid.length} lines compared)`);
+
+    const ratio = Math.min(Math.max(differing, 1) / totalLines, 1);
+    return { changed: true, diffText: lines.join("\n"), ratio };
 }
 
 // --- LCS helpers ---
@@ -238,6 +330,7 @@ export function classifyPriceChange(
     let hasPriceUp = false;
     let hasPriceDown = false;
     let hasStock = false;
+    let subThresholdCount = 0;
 
     for (const d of diffs) {
         if (STOCK_PATH_RE.test(d.path)) {
@@ -249,6 +342,8 @@ export function classifyPriceChange(
             if (pct >= minPct) {
                 if (d.delta !== undefined && d.delta > 0) hasPriceUp = true;
                 else if (d.delta !== undefined && d.delta < 0) hasPriceDown = true;
+            } else {
+                subThresholdCount++;
             }
         }
     }
@@ -256,6 +351,10 @@ export function classifyPriceChange(
     if (hasPriceUp) return "price_up";
     if (hasPriceDown) return "price_down";
     if (hasStock) return "stock";
+    // Every diff is a price move below thresholds.price_change_pct — suppress the
+    // alert entirely rather than downgrading it to a "content" change, which is
+    // what the threshold is documented to do ("低于该阈值不触发价格告警").
+    if (minPct > 0 && subThresholdCount === diffs.length) return null;
     if (diffs.length > 0) return "content";
     return null;
 }

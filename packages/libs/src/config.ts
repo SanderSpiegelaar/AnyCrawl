@@ -113,6 +113,16 @@ export const config = {
         get from(): string {
             return process.env.ANYCRAWL_SMTP_FROM || "AnyCrawl Monitor <no-reply@anycrawl.dev>";
         },
+        // Optional List-Unsubscribe target (RFC 2369). The mailbox is handled by
+        // the operator's mail infrastructure; AnyCrawl only emits the header.
+        get unsubscribeAddress(): string | undefined {
+            return process.env.ANYCRAWL_EMAIL_UNSUBSCRIBE_ADDRESS;
+        },
+        // Optional URL-based unsubscribe target. Enables one-click unsubscribe
+        // (RFC 8058) headers when set. Handled by external infrastructure.
+        get unsubscribeUrl(): string | undefined {
+            return process.env.ANYCRAWL_EMAIL_UNSUBSCRIBE_URL;
+        },
     },
 
     navigation: {

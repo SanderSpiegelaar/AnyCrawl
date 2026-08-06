@@ -33,6 +33,8 @@ export interface TemplateConfig {
     // Basic information
     uuid: string;
     templateId: string;
+    // Optional vanity slug for human-friendly dedicated endpoints. Globally unique when set.
+    slug?: string | null;
     name: string;
     description?: string;
     tags: string[];
@@ -49,6 +51,22 @@ export interface TemplateConfig {
 
     // Request options configuration - structure depends on templateType
     reqOptions: TemplateScrapeSchema | TemplateCrawlSchema | TemplateSearchSchema;
+
+    // ---------------------------------------------------------------------
+    // L3: Orchestrated runtime + output schema + revision pointer
+    // All fields below are OPTIONAL and additive (see design doc §7.2, §8, §9).
+    // ---------------------------------------------------------------------
+
+    // Runtime capability declaration.
+    // Absent runtime is treated as { mode: "single" } (Legacy Run Adapter).
+    runtime?: TemplateRuntimeConfig;
+
+    // Structured output schema for per-item Dataset writes / projections.
+    // Absent outputSchema falls back to the standard result mapping (doc §6.3).
+    outputSchema?: TemplateOutputSchema;
+
+    // Pointer to the current immutable template_revisions row (doc §9.1).
+    currentRevisionId?: string | null;
 
     // Custom handlers code
     customHandlers?: {
@@ -136,18 +154,7 @@ export interface TemplateConfig {
 
     // Template variables
     variables?: {
-        [key: string]: {
-            type: "string" | "number" | "boolean" | "url" | "enum";
-            label?: string;
-            description: string;
-            required: boolean;
-            defaultValue?: any;
-            // For enum type variables, define allowed values
-            values?: Array<string | number | boolean>;
-            // Or provide labeled options; value will be used for validation
-            options?: Array<{ label: string; value: string | number | boolean }>;
-            mapping?: TemplateVariableMapping;
-        };
+        [key: string]: TemplateVariableDefinition;
     };
 
     // User information
@@ -174,6 +181,123 @@ export interface TemplateConfig {
 export interface TemplateVariableMapping {
     target: string;
     mode?: "replace";
+}
+
+// ---------------------------------------------------------------------------
+// L3 contract types (design doc §7.2 runtime, §8 variables/outputSchema, §9 revisions)
+// ---------------------------------------------------------------------------
+
+/**
+ * Scalar variable types supported for both top-level variables and array element
+ * shapes. `array` is only valid at the top level (see `TemplateVariableDefinition`).
+ */
+export type TemplateVariableScalarType = "string" | "number" | "boolean" | "url" | "enum";
+
+/**
+ * Top-level variable types. Adds `array` to the historical scalar set so
+ * templates can declare `string[]` / `enum[]` variables (doc §8).
+ */
+export type TemplateVariableType = TemplateVariableScalarType | "array";
+
+/**
+ * Element type / shape for `array` variables (e.g. Craigslist `cities` = `enum[]`,
+ * `searchQueries` = `string[]`).
+ */
+export interface TemplateVariableItems {
+    type: TemplateVariableScalarType;
+    // For enum element types, the allowed values (either `enum` or `values`).
+    enum?: Array<string | number | boolean>;
+    values?: Array<string | number | boolean>;
+    // Or provide labeled options; `value` is used for validation.
+    options?: Array<{ label: string; value: string | number | boolean }>;
+}
+
+/**
+ * A single template variable definition. Backward compatible with the historical
+ * inline shape; `array`, `items`, `enum`, and the numeric/length constraints are
+ * additive (doc §8).
+ */
+export interface TemplateVariableDefinition {
+    type: TemplateVariableType;
+    label?: string;
+    description: string;
+    required: boolean;
+    defaultValue?: any;
+    // For enum type variables, define allowed values.
+    values?: Array<string | number | boolean>;
+    // Alias for `values` accepted by the §9 validation contract.
+    enum?: Array<string | number | boolean>;
+    // Or provide labeled options; `value` is used for validation.
+    options?: Array<{ label: string; value: string | number | boolean }>;
+    // For `array` variables: element type / shape (doc §8: string[], enum[]).
+    items?: TemplateVariableItems;
+    // Numeric range constraints for `number` variables (doc §8: min <= max).
+    min?: number;
+    max?: number;
+    // Length constraints for `array` variables.
+    minItems?: number;
+    maxItems?: number;
+    mapping?: TemplateVariableMapping;
+}
+
+/**
+ * Runtime capability declaration (doc §7.2 / §8). Absent runtime is treated as
+ * `{ mode: "single" }` by the Legacy Run Adapter.
+ */
+export interface TemplateRuntimeConfig {
+    mode: "single" | "orchestrated";
+    // Page/seed handler protocol version, e.g. "1".
+    handlerProtocolVersion?: string;
+    // Orchestrated mode points at the enabled `customHandlers.seedHandler`;
+    // single mode is null/absent.
+    seedBuilder?: { type: "handler"; name: string } | null;
+    // Template-declared default run options (bounded by platform hard caps).
+    defaultRunOptions?: Record<string, unknown>;
+}
+
+/**
+ * Projection type for a structured output field, mirrored by the Dataset
+ * typed-value columns (doc §11.7).
+ */
+export type TemplateProjectionType = "string" | "number" | "boolean" | "timestamptz";
+
+/**
+ * A single filterable/sortable projection declared by an output schema.
+ * `path` is an RFC 6901 JSON Pointer relative to each item.
+ */
+export interface TemplateOutputProjection {
+    field: string;
+    path: string;
+    type: TemplateProjectionType;
+}
+
+/**
+ * Structured output schema (doc §8). `itemsPath`, `itemKeyPath`, and
+ * `hashExcludePaths` use RFC 6901 JSON Pointers.
+ */
+export interface TemplateOutputSchema {
+    name: string;
+    version: string;
+    // JSON Pointer to the array of items within the handler result.
+    itemsPath?: string;
+    // JSON Pointer to the stable key, relative to each item.
+    itemKeyPath?: string;
+    // JSON Pointers excluded from the Dataset document hash (e.g. volatile timestamps).
+    hashExcludePaths?: string[];
+    projections?: TemplateOutputProjection[];
+}
+
+/**
+ * Immutable template revision snapshot (doc §9.1 `template_revisions`).
+ */
+export interface TemplateRevision {
+    uuid: string;
+    templateUuid: string;
+    version: string;
+    configHash: string;
+    configSnapshot: unknown;
+    schemaSnapshot: unknown;
+    createdAt: Date;
 }
 
 // Template client configuration

@@ -15,7 +15,18 @@ interface Change {
 }
 
 export class EmailNotifier {
-    /** Send a change digest email to all listed recipients. */
+    /**
+     * Send a change digest email to all listed recipients.
+     *
+     * Delivery contract (callers rely on this — resolving means "delivered to
+     * at least one recipient"):
+     * - SMTP is not configured → no-op (logged), resolves; callers gate on
+     *   config.email.enabled before counting delivery.
+     * - nodemailer missing while SMTP IS configured → throws.
+     * - Transport-level send failure → the error propagates (rejects).
+     * - SMTP server rejects ALL recipients → throws a clear Error.
+     * - Partial acceptance → resolves, but rejected addresses are logged as warnings.
+     */
     public static async sendChangeEmail(
         recipients: string[],
         monitor: any,
@@ -27,13 +38,16 @@ export class EmailNotifier {
         }
         if (recipients.length === 0) return;
 
-        // Lazy-load nodemailer to avoid requiring it when email is disabled
+        // Lazy-load nodemailer to avoid requiring it when email is disabled.
+        // Must THROW on failure: SMTP is configured, the caller expects delivery,
+        // and resolving here would falsely mark changes as notified.
         let nodemailer: any;
         try {
             nodemailer = await import("nodemailer");
         } catch {
-            log.warning("[MONITOR EMAIL] nodemailer is not installed — run: pnpm add nodemailer@^6 -F @anycrawl/scrape");
-            return;
+            throw new Error(
+                "[MONITOR EMAIL] SMTP is configured but nodemailer is not installed — run: pnpm add nodemailer@^9 -F @anycrawl/scrape"
+            );
         }
 
         const transporter = nodemailer.default.createTransport({
@@ -49,15 +63,55 @@ export class EmailNotifier {
         const html = buildEmailHtml(monitor, changes);
         const text = buildEmailText(monitor, changes);
 
-        await transporter.sendMail({
+        // List-Unsubscribe headers (RFC 2369 / RFC 8058). We only emit the
+        // headers — the mailto address / URL must be handled by the operator's
+        // mail infrastructure (no unsubscribe endpoint is built in).
+        const headers: Record<string, string> = {};
+        const unsubscribeTargets: string[] = [];
+        if (config.email.unsubscribeAddress) {
+            unsubscribeTargets.push(`<mailto:${config.email.unsubscribeAddress}>`);
+        }
+        if (config.email.unsubscribeUrl) {
+            unsubscribeTargets.push(`<${config.email.unsubscribeUrl}>`);
+        }
+        if (unsubscribeTargets.length > 0) {
+            headers["List-Unsubscribe"] = unsubscribeTargets.join(", ");
+            // One-click unsubscribe (RFC 8058) is only valid alongside a
+            // URL-based List-Unsubscribe target.
+            if (config.email.unsubscribeUrl) {
+                headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click";
+            }
+        }
+
+        // Transport-level failures (connection, auth, ...) propagate to the caller.
+        const info = await transporter.sendMail({
             from: config.email.from,
             to: recipients.join(", "),
             subject,
             html,
             text,
+            ...(Object.keys(headers).length > 0 ? { headers } : {}),
         });
 
-        log.info(`[MONITOR EMAIL] Sent change notification to ${recipients.length} recipient(s) for monitor ${monitor.uuid}`);
+        const toAddress = (r: any): string =>
+            typeof r === "string" ? r : r?.address ?? String(r);
+        const accepted: string[] = (info?.accepted ?? []).map(toAddress);
+        const rejected: string[] = (info?.rejected ?? []).map(toAddress);
+
+        if (rejected.length > 0 && accepted.length === 0) {
+            // Nothing was delivered — surface as an error so callers can record
+            // the failure / retry instead of treating the notification as sent.
+            throw new Error(
+                `SMTP server rejected all recipients (${rejected.join(", ")}) for monitor ${monitor.uuid}`
+            );
+        }
+        if (rejected.length > 0) {
+            log.warning(
+                `[MONITOR EMAIL] SMTP server rejected ${rejected.length} recipient(s) for monitor ${monitor.uuid}: ${rejected.join(", ")}`
+            );
+        }
+
+        log.info(`[MONITOR EMAIL] Sent change notification to ${accepted.length || recipients.length}/${recipients.length} recipient(s) for monitor ${monitor.uuid}`);
     }
 }
 

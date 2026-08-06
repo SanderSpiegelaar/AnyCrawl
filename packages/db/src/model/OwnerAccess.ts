@@ -40,26 +40,29 @@ export async function getOwnedTask(db: DBExecutor, taskId: string, owner: OwnerC
 }
 
 export async function listTasksByOwner(db: DBExecutor, owner: OwnerContext): Promise<any[]> {
+    let rows: any[];
     if (owner.userId) {
-        return await db
+        rows = await db
             .select()
             .from(schemas.scheduledTasks)
             .where(eq(schemas.scheduledTasks.userId, owner.userId))
             .orderBy(sql`${schemas.scheduledTasks.createdAt} DESC`);
-    }
-
-    if (owner.apiKeyId) {
-        return await db
+    } else if (owner.apiKeyId) {
+        rows = await db
             .select()
             .from(schemas.scheduledTasks)
             .where(eq(schemas.scheduledTasks.apiKey, owner.apiKeyId))
             .orderBy(sql`${schemas.scheduledTasks.createdAt} DESC`);
+    } else {
+        rows = await db
+            .select()
+            .from(schemas.scheduledTasks)
+            .orderBy(sql`${schemas.scheduledTasks.createdAt} DESC`);
     }
 
-    return await db
-        .select()
-        .from(schemas.scheduledTasks)
-        .orderBy(sql`${schemas.scheduledTasks.createdAt} DESC`);
+    // Monitor-backed tasks are surfaced under Monitors, not the Scheduled Tasks
+    // list — exclude them (they carry metadata.monitorManaged = true set at create).
+    return rows.filter((task) => task?.metadata?.monitorManaged !== true);
 }
 
 export async function getOwnedWebhook(db: DBExecutor, webhookId: string, owner: OwnerContext): Promise<any | null> {

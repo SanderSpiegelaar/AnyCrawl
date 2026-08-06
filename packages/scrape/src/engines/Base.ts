@@ -13,7 +13,7 @@ import {
     ResponseStatus,
     CrawlerResponse
 } from "../types/crawler.js";
-import { insertJobResult, failedJob, completedJob, Billing, JOB_RESULT_STATUS } from "@anycrawl/db";
+import { insertJobResult, failedJob, completedJob, Billing, JOB_RESULT_STATUS, writeResultToDataset } from "@anycrawl/db";
 import { ProgressManager } from "../managers/Progress.js";
 import { CacheManager } from "../managers/Cache.js";
 import { log, JOB_TYPE_CRAWL, JOB_TYPE_SCRAPE, CreditCalculator, resolveWaitUntil, appConfig, config } from "@anycrawl/libs";
@@ -317,6 +317,26 @@ export abstract class BaseEngine {
                 await failedJob(jobId, error.message, false, { total: 1, completed: 0, failed: 1 });
                 await BandwidthManager.getInstance().flushJob(jobId);
             } catch { }
+
+            // Finalize the scheduled execution as failed at the real failure point
+            // (HTTP error page or retries exhausted). Mirrors the completed-path
+            // finalize in the request handler; see Worker.ts for why this cannot
+            // live in the BullMQ event handlers.
+            const scheduledExecutionId = context.request.userData.scheduled_execution_id;
+            if (scheduledExecutionId) {
+                try {
+                    const { finalizeExecution } = await import("../managers/ExecutionLifecycle.js");
+                    await finalizeExecution({
+                        executionUuid: scheduledExecutionId,
+                        status: "failed",
+                        errorMessage: error.message,
+                        errorCode: "SCRAPE_FAILED",
+                        source: "worker",
+                    });
+                } catch (finalizeError) {
+                    log.warning(`[${queueName}] [${jobId}] Failed to finalize scheduled execution ${scheduledExecutionId}: ${finalizeError}`);
+                }
+            }
         }
 
         log.error(`[${queueName}] [${jobId}] ${error.message} (${error.type})`);
@@ -352,6 +372,27 @@ export abstract class BaseEngine {
                 await failedJob(jobId, error.message, false, { total: 1, completed: 0, failed: 1 });
                 await BandwidthManager.getInstance().flushJob(jobId);
             } catch { }
+
+            // Extraction failure is a terminal outcome for the scrape — finalize
+            // the scheduled execution here too. Without this, the ExtractionError
+            // branch returns before both other finalize sites (persist branch and
+            // handleFailedRequest), leaving the execution 'running' until the
+            // janitor reaps it 30 minutes later as a generic timeout.
+            const scheduledExecutionId = context.request.userData.scheduled_execution_id;
+            if (scheduledExecutionId) {
+                try {
+                    const { finalizeExecution } = await import("../managers/ExecutionLifecycle.js");
+                    await finalizeExecution({
+                        executionUuid: scheduledExecutionId,
+                        status: "failed",
+                        errorMessage: error.message,
+                        errorCode: "EXTRACTION_FAILED",
+                        source: "worker",
+                    });
+                } catch (finalizeError) {
+                    log.warning(`[${queueName}] [${jobId}] Failed to finalize scheduled execution ${scheduledExecutionId}: ${finalizeError}`);
+                }
+            }
         }
 
         log.error(`[${queueName}] [${jobId}] ${error.message} (${error.type})`);
@@ -1199,6 +1240,46 @@ export abstract class BaseEngine {
                     const resultStatus = isHttpError ? JOB_RESULT_STATUS.FAILED : JOB_RESULT_STATUS.SUCCESS;
                     await insertJobResult(resultJobId, context.request.url, data, resultStatus);
 
+                    // Dataset output (additive): for crawl jobs carrying an output.dataset
+                    // binding, persist this successful page via the shared Dataset Writer.
+                    // Fully isolated — a write failure only warns; it never fails the page.
+                    if (
+                        !isHttpError &&
+                        context.request.userData.type === JOB_TYPE_CRAWL &&
+                        context.request.userData.crawl_options?.dataset
+                    ) {
+                        const dsConfig = context.request.userData.crawl_options.dataset as {
+                            datasetId: string;
+                            scopeType: "crawl";
+                            mapping: any;
+                            owner: any;
+                        };
+                        // Key the run by the crawl job (parentId), so every page of a
+                        // crawl maps to a SINGLE dataset_run — for both the in-crawler
+                        // link-following path (parentId === jobId) and the auto-crawl
+                        // coordinator path (each page is a child job with parentId set).
+                        const crawlJobId = (context.request.userData.parentId || context.request.userData.jobId) as string;
+                        try {
+                            await writeResultToDataset({
+                                producerType: "crawl",
+                                producerId: crawlJobId,
+                                jobId: crawlJobId,
+                                scope: { kind: "job", jobId: crawlJobId },
+                                scopeType: "crawl",
+                                result: data,
+                                mapping: dsConfig.mapping,
+                                owner: dsConfig.owner,
+                                dataset: { datasetId: dsConfig.datasetId },
+                                // Per-page write of a multi-page run: accumulate, don't finalize.
+                                finalizeRun: false,
+                            });
+                        } catch (datasetError) {
+                            log.warning(
+                                `[${context.request.userData.queueName}] [${crawlJobId}] Dataset write failed for ${context.request.url}: ${datasetError instanceof Error ? datasetError.message : String(datasetError)}`
+                            );
+                        }
+                    }
+
                     // Save to cache only for successful responses
                     try {
                         const options = context.request.userData.options || {};
@@ -1377,6 +1458,24 @@ export abstract class BaseEngine {
                         await completedJob(jobId, true, { total: 1, completed: 1, failed: 0 });
                         await BandwidthManager.getInstance().flushJob(jobId);
                     } catch { }
+
+                    // Finalize the scheduled execution HERE — at real scrape completion,
+                    // after the job result row exists — not when the queue job merely
+                    // handed the URL to the crawler (see Worker.ts). This is what allows
+                    // the monitor post-processor to see job_results and write snapshots.
+                    const scheduledExecutionId = context.request.userData.scheduled_execution_id;
+                    if (scheduledExecutionId) {
+                        try {
+                            const { finalizeExecution } = await import("../managers/ExecutionLifecycle.js");
+                            await finalizeExecution({
+                                executionUuid: scheduledExecutionId,
+                                status: "completed",
+                                source: "worker",
+                            });
+                        } catch (finalizeError) {
+                            log.warning(`[${queueName}] [${jobId}] Failed to finalize scheduled execution ${scheduledExecutionId}: ${finalizeError}`);
+                        }
+                    }
                 }
                 // For crawl jobs: mark page done and try finalize
                 if (context.request.userData.type === JOB_TYPE_CRAWL) {

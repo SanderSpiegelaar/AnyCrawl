@@ -19,9 +19,9 @@ export function validateTemplateOnlyFields(
 
     // Define allowed fields based on template type
     const allowedFieldsMap: Record<typeof templateType, Set<string>> = {
-        scrape: new Set(['template_id', 'url', 'variables']),
-        crawl: new Set(['template_id', 'url', 'variables']),
-        search: new Set(['template_id', 'query', 'variables']),
+        scrape: new Set(['template_id', 'url', 'variables', 'output']),
+        crawl: new Set(['template_id', 'url', 'variables', 'output']),
+        search: new Set(['template_id', 'query', 'variables', 'output']),
         batch: new Set(['template_id', 'urls', 'variables', 'ignore_invalid_urls'])
     };
 

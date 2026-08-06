@@ -7,7 +7,10 @@ import { MapController } from "../../controllers/v1/MapController.js";
 import { ScheduledTasksController } from "../../controllers/v1/ScheduledTasksController.js";
 import { WebhooksController } from "../../controllers/v1/WebhooksController.js";
 import { MonitorController } from "../../controllers/v1/MonitorController.js";
+import { DatasetController } from "../../controllers/v1/DatasetController.js";
+import { TemplateEndpointController } from "../../controllers/v1/TemplateEndpointController.js";
 import { controllerWrapper } from "../../utils/AsyncHandler.js";
+import { checkCreditsMiddleware } from "../../middlewares/CheckCreditsMiddleware.js";
 
 const router: express.Router = Router();
 const scrapeController = new ScrapeController();
@@ -18,19 +21,28 @@ const mapController = new MapController();
 const scheduledTasksController = new ScheduledTasksController();
 const webhooksController = new WebhooksController();
 const monitorController = new MonitorController();
+const datasetController = new DatasetController();
+const templateEndpointController = new TemplateEndpointController();
 
-router.post("/scrape", controllerWrapper(scrapeController.handle));
-router.post("/search", controllerWrapper(searchController.handle));
-router.post("/map", controllerWrapper(mapController.map));
+// Billing routes carry the credit gate at their definition (fail-closed). Any new billing route
+// MUST attach `checkCreditsMiddleware` here — there is no central allowlist to keep in sync.
+router.post("/scrape", checkCreditsMiddleware, controllerWrapper(scrapeController.handle));
+router.post("/search", checkCreditsMiddleware, controllerWrapper(searchController.handle));
+router.post("/map", checkCreditsMiddleware, controllerWrapper(mapController.map));
+
+// Per-template dedicated endpoints (dispatches to scrape/search/crawl by template type).
+// Exact sub-paths (/execute) take precedence over the bare `:templateRef` param in Express.
+router.get("/template/:templateRef", controllerWrapper(templateEndpointController.spec));
+router.post("/template/:templateRef/execute", checkCreditsMiddleware, controllerWrapper(templateEndpointController.execute));
 
 // Batch scrape routes (async job model)
-router.post("/batch/scrape", controllerWrapper(batchScrapeController.start));
+router.post("/batch/scrape", checkCreditsMiddleware, controllerWrapper(batchScrapeController.start));
 router.get("/batch/scrape/:jobId/status", controllerWrapper(batchScrapeController.status));
 router.get("/batch/scrape/:jobId", controllerWrapper(batchScrapeController.results));
 router.delete("/batch/scrape/:jobId", controllerWrapper(batchScrapeController.cancel));
 
 // Crawl routes
-router.post("/crawl", controllerWrapper(crawlController.start));
+router.post("/crawl", checkCreditsMiddleware, controllerWrapper(crawlController.start));
 router.get("/crawl/:jobId/status", controllerWrapper(crawlController.status));
 router.get("/crawl/:jobId", controllerWrapper(crawlController.results));
 router.delete("/crawl/:jobId", controllerWrapper(crawlController.cancel));
@@ -69,8 +81,23 @@ router.post("/monitors/:id/pause", controllerWrapper(monitorController.pause));
 router.post("/monitors/:id/resume", controllerWrapper(monitorController.resume));
 router.post("/monitors/:id/check", controllerWrapper(monitorController.check));
 router.get("/monitors/:id/snapshots", controllerWrapper(monitorController.snapshots));
+router.get("/monitors/:id/snapshots/:snapshotId", controllerWrapper(monitorController.snapshotDetail));
 router.get("/monitors/:id/changes", controllerWrapper(monitorController.changes));
 router.get("/monitors/:id/changes/:changeId", controllerWrapper(monitorController.changeDetail));
+
+// Dataset routes (READ + management). Dataset reads/writes are NOT billed in v1 —
+// do NOT attach checkCreditsMiddleware to any dataset route.
+router.post("/datasets", controllerWrapper(datasetController.create));
+router.get("/datasets", controllerWrapper(datasetController.list));
+router.get("/datasets/:id", controllerWrapper(datasetController.get));
+router.patch("/datasets/:id", controllerWrapper(datasetController.update));
+router.delete("/datasets/:id", controllerWrapper(datasetController.delete));
+router.get("/datasets/:id/items", controllerWrapper(datasetController.items));
+router.get("/datasets/:id/runs", controllerWrapper(datasetController.runs));
+router.get("/datasets/:id/runs/:run_id", controllerWrapper(datasetController.run));
+router.get("/datasets/:id/runs/:run_id/items", controllerWrapper(datasetController.runItems));
+router.get("/datasets/:id/runs/:run_id/warnings", controllerWrapper(datasetController.runWarnings));
+router.get("/datasets/:id/changes", controllerWrapper(datasetController.changes));
 
 // Error handler
 router.use(((err, req, res, next) => {

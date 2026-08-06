@@ -7,7 +7,6 @@ import morgan from "morgan";
 import responseTime from "response-time";
 import { logMiddleware } from "./middlewares/LogMiddleware.js";
 import { authMiddleware } from "./middlewares/AuthMiddleware.js";
-import { checkCreditsMiddleware } from "./middlewares/CheckCreditsMiddleware.js";
 import { deductCreditsMiddleware } from "./middlewares/DeductCreditsMiddleware.js";
 import { log, ConsoleStream } from "@anycrawl/libs/log";
 import { appConfig } from "@anycrawl/libs";
@@ -65,9 +64,8 @@ app.use("/v1/public", v1PublicRouter);
 
 // check Auth
 app.use(authMiddleware);
-// check credits
-app.use(checkCreditsMiddleware);
-// deduct credits after successful requests
+// deduct credits after successful requests (fail-closed: asserts chargeable requests passed the
+// route-level credit gate; the gate itself is now attached per billing route inside the v1 router)
 app.use(deductCreditsMiddleware);
 // load routers
 app.use("/v1", v1Router);

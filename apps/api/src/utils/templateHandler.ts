@@ -27,7 +27,7 @@ export class TemplateHandler {
      * @param currentUserId - Current user ID from API key
      * @returns true if user has permission, false otherwise
      */
-    private static hasTemplateAccess(template: any, currentUserId?: string): boolean {
+    public static hasTemplateAccess(template: any, currentUserId?: string): boolean {
         // If current request API key has no associated user, any template can be used
         // for self-hosted
         if (!currentUserId) {

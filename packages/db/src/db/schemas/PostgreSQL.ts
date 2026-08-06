@@ -178,6 +178,9 @@ export const templates = p.pgTable("templates", {
         .$defaultFn(() => randomUUID()),
     // Template ID (business identifier)
     templateId: p.text("template_id").notNull().unique(),
+    // Vanity slug for human-friendly dedicated endpoints (e.g. /v1/template/{slug}/execute).
+    // Nullable + globally unique; templates without a slug are addressed by templateId only.
+    slug: p.text("slug").unique(),
     // Template name
     name: p.text("name").notNull(),
     // Template description
@@ -214,6 +217,11 @@ export const templates = p.pgTable("templates", {
     publishedAt: p.timestamp("published_at"),
     reviewedAt: p.timestamp("reviewed_at"),
     archivedAt: p.timestamp("archived_at"),
+    // [L3] Pointer to the current immutable template_revisions snapshot (§9.1 rule 7).
+    // Deliberately a plain nullable uuid with NO .references(): template_revisions FKs
+    // back to templates.uuid, so a real FK here would create a circular dependency and
+    // an unsatisfiable insert ordering. The pointer is maintained in application code.
+    currentRevisionUuid: p.uuid("current_revision_uuid"),
 });
 
 export const templateExecutions = p.pgTable("template_executions", {
@@ -495,4 +503,271 @@ export const monitorChanges = p.pgTable("monitor_changes", {
     createdAt: p.timestamp("created_at", { withTimezone: true }).default(sql`now()`).notNull(),
 }, (table) => [
     p.index("monitor_changes_monitor_idx").on(table.monitorUuid, table.createdAt),
+]);
+
+// ============================================================================
+// Dataset (L2) tables — platform §11 / dedicated §5.9.
+// MVP tables: datasets, dataset_runs, dataset_items, dataset_item_changes.
+// FULL-only tables: dataset_run_items, dataset_item_scopes, dataset_item_field_values, run_warnings.
+// MVP -> full is pure add-table/add-column/add-constraint (R2 forward-compat, no renames).
+// ============================================================================
+
+export const datasets = p.pgTable("datasets", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    apiKey: p.uuid("api_key_id").references(() => apiKey.uuid),
+    userId: p.uuid("user_id"),
+    name: p.text("name").notNull(),
+    description: p.text("description"),
+    sourceType: p.text("source_type").notNull(),
+    sourceTemplateId: p.text("source_template_id"),
+    sourceTemplateRevisionUuid: p.uuid("source_template_revision_uuid"),          // [RESERVED per R2] FK -> template_revisions in L3
+    schemaName: p.text("schema_name").notNull(),
+    schemaVersion: p.text("schema_version").notNull(),
+    retentionPolicy: p.jsonb("retention_policy").$type<{ item_days?: number; change_days?: number }>(),
+    itemCount: p.integer("item_count").notNull().default(0),
+    activeItemCount: p.integer("active_item_count").notNull().default(0),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+    updatedAt: p.timestamp("updated_at", { withTimezone: true }).notNull(),
+    deletedAt: p.timestamp("deleted_at", { withTimezone: true }),
+}, (t) => [
+    p.index("ix_datasets_user_created").on(t.userId, t.createdAt, t.uuid).where(sql`${t.deletedAt} IS NULL`),
+    p.index("ix_datasets_apikey_created").on(t.apiKey, t.createdAt, t.uuid).where(sql`${t.deletedAt} IS NULL`),
+]);
+
+export const datasetRuns = p.pgTable("dataset_runs", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    datasetId: p.uuid("dataset_id").notNull().references(() => datasets.uuid, { onDelete: "cascade" }),
+    producerType: p.text("producer_type").notNull(),
+    producerId: p.text("producer_id").notNull(),
+    jobUuid: p.uuid("job_uuid").references(() => jobs.uuid),
+    scheduledTaskUuid: p.uuid("scheduled_task_uuid").references(() => scheduledTasks.uuid),   // [RESERVED per R2]
+    templateRunUuid: p.uuid("template_run_uuid"),                                             // [RESERVED per R2] FK -> template_runs in L3
+    scopeKey: p.text("scope_key").notNull(),
+    status: p.text("status").notNull(),
+    coverageComplete: p.boolean("coverage_complete").notNull().default(false),
+    itemsSeen: p.integer("items_seen").notNull().default(0),
+    itemsCreated: p.integer("items_created").notNull().default(0),
+    itemsUpdated: p.integer("items_updated").notNull().default(0),
+    itemsUnchanged: p.integer("items_unchanged").notNull().default(0),
+    itemsRemoved: p.integer("items_removed").notNull().default(0),
+    warningCount: p.integer("warning_count").notNull().default(0),
+    warningSummary: p.jsonb("warning_summary").$type<Array<{ code: string; count: number }>>(),
+    startedAt: p.timestamp("started_at", { withTimezone: true }),
+    finishedAt: p.timestamp("finished_at", { withTimezone: true }),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+    updatedAt: p.timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.uniqueIndex("uq_dataset_run_producer").on(t.datasetId, t.producerType, t.producerId),
+    p.index("ix_dataset_run_job").on(t.jobUuid),
+    p.index("ix_dataset_run_scheduled_task").on(t.scheduledTaskUuid),
+    p.index("ix_dataset_run_template_run").on(t.templateRunUuid),
+    p.index("ix_dataset_run_scope").on(t.datasetId, t.scopeKey, t.status),
+]);
+
+export const datasetItems = p.pgTable("dataset_items", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    datasetId: p.uuid("dataset_id").notNull().references(() => datasets.uuid, { onDelete: "cascade" }),
+    itemKey: p.text("item_key").notNull(),
+    sourceType: p.text("source_type").notNull(),
+    sourceUrl: p.text("source_url"),
+    document: p.jsonb("document").notNull().$type<Record<string, unknown>>(),
+    documentHash: p.text("document_hash").notNull(),
+    firstSeenAt: p.timestamp("first_seen_at", { withTimezone: true }).notNull(),
+    lastSeenAt: p.timestamp("last_seen_at", { withTimezone: true }).notNull(),
+    isActive: p.boolean("is_active").notNull().default(true),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+    updatedAt: p.timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.uniqueIndex("uq_dataset_item").on(t.datasetId, t.itemKey),
+    p.index("ix_dataset_item_cursor").on(t.datasetId, t.lastSeenAt, t.uuid),
+]);
+
+export const datasetRunItems = p.pgTable("dataset_run_items", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    datasetRunId: p.uuid("dataset_run_id").notNull().references(() => datasetRuns.uuid, { onDelete: "cascade" }),
+    datasetItemId: p.uuid("dataset_item_id").notNull().references(() => datasetItems.uuid, { onDelete: "cascade" }),
+    itemKey: p.text("item_key").notNull(),
+    sequence: p.integer("sequence"),
+    seedKey: p.text("seed_key"),
+    seedIndex: p.integer("seed_index"),
+    pageIndex: p.integer("page_index"),
+    position: p.integer("position"),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.uniqueIndex("uq_dataset_run_item").on(t.datasetRunId, t.itemKey),
+    p.uniqueIndex("uq_dataset_run_item_sequence").on(t.datasetRunId, t.sequence).where(sql`${t.sequence} IS NOT NULL`),
+    p.index("ix_dataset_run_item_seq").on(t.datasetRunId, t.sequence),
+    p.index("ix_dataset_run_item_occurrence").on(t.datasetRunId, t.seedIndex, t.pageIndex, t.position),
+    p.index("ix_dataset_run_item_item").on(t.datasetItemId),
+]);
+
+export const datasetItemScopes = p.pgTable("dataset_item_scopes", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    datasetId: p.uuid("dataset_id").notNull().references(() => datasets.uuid, { onDelete: "cascade" }),
+    datasetItemId: p.uuid("dataset_item_id").notNull().references(() => datasetItems.uuid, { onDelete: "cascade" }),
+    itemKey: p.text("item_key").notNull(),
+    scopeKey: p.text("scope_key").notNull(),
+    firstSeenAt: p.timestamp("first_seen_at", { withTimezone: true }).notNull(),
+    lastSeenAt: p.timestamp("last_seen_at", { withTimezone: true }).notNull(),
+    isActive: p.boolean("is_active").notNull().default(true),
+    updatedAt: p.timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.uniqueIndex("uq_dataset_item_scope").on(t.datasetId, t.itemKey, t.scopeKey),
+    p.index("ix_dataset_item_scope_recon").on(t.datasetId, t.scopeKey, t.isActive),
+    p.index("ix_dataset_item_scope_item").on(t.datasetItemId),
+]);
+
+export const datasetItemChanges = p.pgTable("dataset_item_changes", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    datasetId: p.uuid("dataset_id").notNull().references(() => datasets.uuid, { onDelete: "cascade" }),
+    datasetRunId: p.uuid("dataset_run_id").notNull().references(() => datasetRuns.uuid, { onDelete: "cascade" }),
+    datasetItemId: p.uuid("dataset_item_id").notNull().references(() => datasetItems.uuid, { onDelete: "cascade" }),
+    itemKey: p.text("item_key").notNull(),
+    scopeKey: p.text("scope_key").notNull(),
+    changeType: p.text("change_type").notNull(),
+    beforeHash: p.text("before_hash"),
+    afterHash: p.text("after_hash"),
+    fieldChanges: p.jsonb("field_changes").$type<Record<string, { before: unknown; after: unknown }>>(),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.uniqueIndex("uq_dataset_change").on(t.datasetRunId, t.itemKey, t.changeType),
+    p.index("ix_dataset_change_run_cursor").on(t.datasetRunId, t.createdAt, t.uuid),
+    p.index("ix_dataset_change_dataset_cursor").on(t.datasetId, t.createdAt, t.uuid),
+    p.index("ix_dataset_change_item").on(t.datasetItemId),
+]);
+
+export const datasetItemFieldValues = p.pgTable("dataset_item_field_values", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    datasetId: p.uuid("dataset_id").notNull().references(() => datasets.uuid, { onDelete: "cascade" }),
+    itemKey: p.text("item_key").notNull(),
+    fieldName: p.text("field_name").notNull(),
+    fieldType: p.text("field_type").notNull(),
+    stringValue: p.text("string_value"),
+    numberValue: p.numeric("number_value"),
+    booleanValue: p.boolean("boolean_value"),
+    timestamptzValue: p.timestamp("timestamptz_value", { withTimezone: true }),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+    updatedAt: p.timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.uniqueIndex("uq_dataset_item_field").on(t.datasetId, t.itemKey, t.fieldName),
+    p.check("dataset_item_field_values_typed_value_chk", sql`
+        (${t.fieldType} = 'string'      AND ${t.stringValue}      IS NOT NULL AND ${t.numberValue} IS NULL AND ${t.booleanValue} IS NULL AND ${t.timestamptzValue} IS NULL)
+     OR (${t.fieldType} = 'number'      AND ${t.numberValue}      IS NOT NULL AND ${t.stringValue} IS NULL AND ${t.booleanValue} IS NULL AND ${t.timestamptzValue} IS NULL)
+     OR (${t.fieldType} = 'boolean'     AND ${t.booleanValue}     IS NOT NULL AND ${t.stringValue} IS NULL AND ${t.numberValue} IS NULL AND ${t.timestamptzValue} IS NULL)
+     OR (${t.fieldType} = 'timestamptz' AND ${t.timestamptzValue} IS NOT NULL AND ${t.stringValue} IS NULL AND ${t.numberValue} IS NULL AND ${t.booleanValue} IS NULL)
+    `),
+    p.index("ix_dsfv_string").on(t.datasetId, t.fieldName, t.stringValue),
+    p.index("ix_dsfv_number").on(t.datasetId, t.fieldName, t.numberValue),
+    p.index("ix_dsfv_boolean").on(t.datasetId, t.fieldName, t.booleanValue),
+    p.index("ix_dsfv_timestamptz").on(t.datasetId, t.fieldName, t.timestamptzValue),
+]);
+
+export const runWarnings = p.pgTable("run_warnings", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    templateRunUuid: p.uuid("template_run_uuid"),                                             // [RESERVED] FK -> template_runs in L3
+    datasetRunId: p.uuid("dataset_run_id").references(() => datasetRuns.uuid, { onDelete: "cascade" }),
+    scope: p.text("scope").notNull(),
+    code: p.text("code").notNull(),
+    message: p.text("message"),
+    itemKey: p.text("item_key"),
+    url: p.text("url"),
+    seedKey: p.text("seed_key"),
+    seedIndex: p.integer("seed_index"),
+    pageIndex: p.integer("page_index"),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.check("run_warnings_run_ref_chk", sql`${t.templateRunUuid} IS NOT NULL OR ${t.datasetRunId} IS NOT NULL`),
+    p.index("ix_run_warnings_dataset_run").on(t.datasetRunId, t.createdAt, t.uuid),
+    p.index("ix_run_warnings_template_run").on(t.templateRunUuid, t.createdAt, t.uuid),
+    p.index("ix_run_warnings_code").on(t.datasetRunId, t.code),
+]);
+
+// ============================================================================
+// Template Revisions (L3) — immutable template version snapshots (platform §9.1).
+// A revision freezes the full execution config + output schema for a template so
+// historical Runs/Schedules stay reproducible and are unaffected by later edits.
+// UNIQUE(template_uuid, config_hash) makes concurrent get-or-create idempotent
+// (§9.1 rule 6). templates.current_revision_uuid points at the active revision.
+// ============================================================================
+
+export const templateRevisions = p.pgTable("template_revisions", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    templateUuid: p.uuid("template_uuid").notNull().references(() => templates.uuid, { onDelete: "cascade" }),
+    version: p.text("version").notNull(),
+    configHash: p.text("config_hash").notNull(),
+    configSnapshot: p.jsonb("config_snapshot").notNull().$type<Record<string, unknown>>(),
+    schemaSnapshot: p.jsonb("schema_snapshot").$type<Record<string, unknown>>(),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.uniqueIndex("uq_template_revision").on(t.templateUuid, t.configHash),
+    p.index("ix_template_revision_created").on(t.templateUuid, t.createdAt, t.uuid),
+]);
+
+// ============================================================================
+// Template Runs (L3 Phase 3) — the unified async run record for every Template
+// execution, legacy or orchestrated (platform §9.2). One row carries owner,
+// the frozen revision + input snapshot, the dataset destination, and the full
+// lifecycle: status advances queued→running→{completed|partial|failed} and
+// cancelling→cancelled (§5); terminal states are immutable. `template_run_events`
+// is the append-only audit feed backing `/events` cursor polling (§11.8).
+//
+// FK notes: `template_uuid` cascades like `template_revisions` (a run is history
+// owned by its template). Association FKs (revision/dataset/dataset_run/legacy
+// job) are plain nullable references. The reserved `dataset_runs.template_run_uuid`
+// and `run_warnings.template_run_uuid` columns stay FK-less to avoid the circular
+// dependency (they are declared above this table).
+//
+// Idempotency: `idempotency_scope_hash` is derived from Owner + Template +
+// original Idempotency-Key (§9.2 rule 2), so owner is already baked into the
+// value. A single partial unique index over (template_uuid, idempotency_scope_hash)
+// WHERE hash IS NOT NULL therefore makes create idempotent without persisting a
+// cross-owner plaintext tuple and without needing two owner-keyed indexes.
+// ============================================================================
+
+export const templateRuns = p.pgTable("template_runs", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    apiKey: p.uuid("api_key_id").references(() => apiKey.uuid),
+    userId: p.uuid("user_id"),
+    templateUuid: p.uuid("template_uuid").notNull().references(() => templates.uuid, { onDelete: "cascade" }),
+    templateRevisionUuid: p.uuid("template_revision_uuid").references(() => templateRevisions.uuid),  // nullable: legacy adapter may run current config
+    mode: p.text("mode").notNull(),                                                                    // single | orchestrated
+    status: p.text("status").notNull(),                                                                // queued | running | partial | completed | failed | cancelling | cancelled
+    idempotencyScopeHash: p.text("idempotency_scope_hash"),
+    inputSnapshot: p.jsonb("input_snapshot").$type<Record<string, unknown>>(),
+    normalizedInputHash: p.text("normalized_input_hash"),
+    runOptions: p.jsonb("run_options").$type<Record<string, unknown>>(),
+    datasetId: p.uuid("dataset_id").references(() => datasets.uuid),
+    datasetRunUuid: p.uuid("dataset_run_uuid").references(() => datasetRuns.uuid),
+    legacyJobUuid: p.uuid("legacy_job_uuid").references(() => jobs.uuid),
+    statistics: p.jsonb("statistics").$type<Record<string, unknown>>(),
+    stopReason: p.text("stop_reason"),
+    errorCode: p.text("error_code"),
+    errorMessage: p.text("error_message"),
+    cancelRequestedAt: p.timestamp("cancel_requested_at", { withTimezone: true }),
+    startedAt: p.timestamp("started_at", { withTimezone: true }),
+    finishedAt: p.timestamp("finished_at", { withTimezone: true }),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+    updatedAt: p.timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.index("ix_template_run_user_created").on(t.userId, t.createdAt, t.uuid),
+    p.index("ix_template_run_apikey_created").on(t.apiKey, t.createdAt, t.uuid),
+    p.index("ix_template_run_template_created").on(t.templateUuid, t.createdAt, t.uuid),
+    p.uniqueIndex("uq_template_run_idempotency")
+        .on(t.templateUuid, t.idempotencyScopeHash)
+        .where(sql`${t.idempotencyScopeHash} IS NOT NULL`),
+    // Explicit FK indexes (§11.9 rule 1); owner/template FKs are covered by the composite lists above.
+    p.index("ix_template_run_revision").on(t.templateRevisionUuid),
+    p.index("ix_template_run_dataset").on(t.datasetId),
+    p.index("ix_template_run_dataset_run").on(t.datasetRunUuid),
+    p.index("ix_template_run_legacy_job").on(t.legacyJobUuid),
+]);
+
+export const templateRunEvents = p.pgTable("template_run_events", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    templateRunUuid: p.uuid("template_run_id").notNull().references(() => templateRuns.uuid, { onDelete: "cascade" }),
+    eventType: p.text("event_type").notNull(),
+    payload: p.jsonb("payload").$type<Record<string, unknown>>(),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    p.index("ix_template_run_event_cursor").on(t.templateRunUuid, t.createdAt, t.uuid),
 ]);

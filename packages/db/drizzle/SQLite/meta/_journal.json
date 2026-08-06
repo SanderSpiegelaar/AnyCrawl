@@ -78,6 +78,34 @@
       "when": 1783783436192,
       "tag": "0010_sturdy_thunderbolt",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1785941967773,
+      "tag": "0011_add_template_slug",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1785945315488,
+      "tag": "0012_dataset_core_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1785954257079,
+      "tag": "0013_template_revisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1785958653688,
+      "tag": "0014_template_runs",
+      "breakpoints": true
     }
   ]
 }

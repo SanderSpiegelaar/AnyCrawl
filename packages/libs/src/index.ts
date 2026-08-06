@@ -11,3 +11,4 @@ export * from "./config.js";
 export * from "./types/index.js";
 export * from "./data/index.js";
 export * from "./cache/index.js";
+export * from "./template/validate-contract.js";

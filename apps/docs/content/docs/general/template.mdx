@@ -77,6 +77,228 @@ result = response.json()
 print(result['data'])
 ```
 
+## Dedicated Template Endpoints
+
+Every template also gets its **own URL**, so you can call it directly instead of passing `template_id` inside a `/v1/scrape`, `/v1/search`, or `/v1/crawl` body. This is handy for sharing a template as a branded short link, wiring it into no-code tools, or letting a client discover a template's inputs before calling it.
+
+```
+POST  https://api.anycrawl.dev/v1/template/{ref}/execute   # run the template
+GET   https://api.anycrawl.dev/v1/template/{ref}            # call-spec (discovery)
+```
+
+### Addressing a template (`{ref}`)
+
+`{ref}` is either:
+
+- the template's **vanity slug** (preferred — e.g. `content-extractor`), or
+- the **`templateId`** (e.g. `my-user~my-template`).
+
+Both resolve to the same template. The slug produces the nicer, brandable link.
+
+<Callout type="info">
+These endpoints behave **identically** to a body `template_id` call — same option merging, variable validation, domain restrictions, URL/query transforms, caching, webhooks, and `pricing.perCall` billing. Only the addressing changes.
+</Callout>
+
+### Execute a template
+
+`POST /v1/template/{ref}/execute` runs the template. The body accepts **only** `url`, `query`, and `variables` — every other option comes from the template. Providing any other field returns a **400 validation error**.
+
+The response shape depends on the template's type:
+
+| Template type | Sync / Async | Returns |
+| ------------- | ------------ | -------------------------------------------------- |
+| `scrape`      | Synchronous  | `ScrapeResult` (in `data`)                         |
+| `search`      | Synchronous  | `SearchResult[]` (in `data`)                       |
+| `crawl`       | Asynchronous | `{ job_id, status, message }` — then poll (see below) |
+
+#### Scrape / Search templates (synchronous)
+
+```bash tab="cURL"
+# Scrape template — pass `url`
+curl -X POST "https://api.anycrawl.dev/v1/template/content-extractor/execute" \
+  -H "Authorization: Bearer <YOUR_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com",
+    "variables": { "category": "tech" }
+  }'
+
+# Search template — pass `query`
+curl -X POST "https://api.anycrawl.dev/v1/template/news-search/execute" \
+  -H "Authorization: Bearer <YOUR_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "machine learning",
+    "variables": { "lang": "en" }
+  }'
+```
+
+```javascript tab="JavaScript (SDK)"
+import { AnyCrawlClient } from "@anycrawl/js-sdk";
+
+const client = new AnyCrawlClient(process.env.ANYCRAWL_API_KEY);
+
+// Scrape template -> ScrapeResult
+const scraped = await client.template("content-extractor").execute({
+  url: "https://example.com",
+  variables: { category: "tech" },
+});
+
+// Search template -> SearchResult[]
+const results = await client.template("news-search").execute({
+  query: "machine learning",
+  variables: { lang: "en" },
+});
+```
+
+The synchronous response is the same envelope as the underlying endpoint:
+
+```json
+{
+  "success": true,
+  "data": {
+    "url": "https://example.com",
+    "status": "completed",
+    "markdown": "# Page Title\n\nContent...",
+    "metadata": { }
+  }
+}
+```
+
+#### Crawl templates (asynchronous)
+
+A `crawl` template returns a **`job_id`** immediately. Poll `/v1/crawl/{job_id}/status` for progress and fetch pages from `/v1/crawl/{job_id}` — exactly as with a normal crawl.
+
+```bash tab="cURL"
+# 1. Start the crawl — returns a job_id
+curl -X POST "https://api.anycrawl.dev/v1/template/docs-crawler/execute" \
+  -H "Authorization: Bearer <YOUR_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://docs.example.com",
+    "variables": { "maxPages": 50 }
+  }'
+
+# 2. Poll status
+curl -H "Authorization: Bearer <YOUR_API_KEY>" \
+  "https://api.anycrawl.dev/v1/crawl/<JOB_ID>/status"
+
+# 3. Fetch results (paginated)
+curl -H "Authorization: Bearer <YOUR_API_KEY>" \
+  "https://api.anycrawl.dev/v1/crawl/<JOB_ID>?skip=0"
+```
+
+```javascript tab="JavaScript (SDK)"
+import { AnyCrawlClient } from "@anycrawl/js-sdk";
+
+const client = new AnyCrawlClient(process.env.ANYCRAWL_API_KEY);
+
+// Crawl template -> { job_id, status, message }
+const job = await client.template("docs-crawler").execute({
+  url: "https://docs.example.com",
+  variables: { maxPages: 50 },
+});
+
+if ("job_id" in job) {
+  const status = await client.getCrawlStatus(job.job_id);
+  const page = await client.getCrawlResults(job.job_id, 0);
+  // ...or use the blocking helper: await client.crawl(...) with template_id instead
+}
+```
+
+The start response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "job_id": "7a2e165d-8f81-4be6-9ef7-23222330a396",
+    "status": "created",
+    "message": "Crawl job created successfully"
+  }
+}
+```
+
+### Discover a template (call-spec)
+
+`GET /v1/template/{ref}` returns a **redacted call-spec** describing the template's inputs, pricing, and endpoint — without ever exposing internal handlers or request options. Use it to self-describe a template in a UI or to validate inputs before calling.
+
+```bash tab="cURL"
+curl -H "Authorization: Bearer <YOUR_API_KEY>" \
+  "https://api.anycrawl.dev/v1/template/content-extractor"
+```
+
+```javascript tab="JavaScript (SDK)"
+import { AnyCrawlClient } from "@anycrawl/js-sdk";
+
+const client = new AnyCrawlClient(process.env.ANYCRAWL_API_KEY);
+
+const spec = await client.template("content-extractor").spec();
+console.log(spec.template_type); // "scrape" | "search" | "crawl"
+console.log(spec.variables, spec.pricing, spec.allowed_domains);
+```
+
+**Example response:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "template_id": "my-user~content-extractor",
+    "slug": "content-extractor",
+    "name": "Content Extractor",
+    "description": "Extract clean article content from any page.",
+    "template_type": "scrape",
+    "version": 3,
+    "endpoint": {
+      "method": "POST",
+      "path": "/v1/template/content-extractor/execute"
+    },
+    "variables": {
+      "category": {
+        "type": "string",
+        "required": false,
+        "defaultValue": "general",
+        "description": "Content category tag"
+      }
+    },
+    "pricing": {
+      "perCall": 10,
+      "currency": "credits"
+    },
+    "allowed_domains": {
+      "type": "glob",
+      "patterns": ["*.example.com"]
+    }
+  }
+}
+```
+
+### Pricing
+
+- **`execute`** is billed the same as any template call — the template's `pricing.perCall` credits (plus any per-URL usage for crawl). Billing is identical to a body `template_id` call.
+- **`GET /v1/template/{ref}`** (call-spec) is **free** — discovery is never billed.
+
+### Errors
+
+| Error                        | HTTP Status | `data.type`           | Description                                                        |
+| ---------------------------- | ----------- | --------------------- | ----------------------------------------------------------------- |
+| Template not found           | 404         | `TEMPLATE_NOT_FOUND`  | `{ref}` doesn't resolve to a template, or you lack access to it   |
+| Access denied                | 403         | `ACCESS_DENIED`       | You don't have permission to use this template                    |
+| Domain restriction violation | 403         | —                     | `url` not allowed by the template's domain policy                 |
+| Validation error             | 400         | `VALIDATION_ERROR`    | Missing/invalid variables, disallowed body fields, or a body `template_id` that conflicts with `{ref}` |
+
+**Example error response:**
+
+```json
+{
+  "success": false,
+  "error": "Not found",
+  "message": "Template not found: content-extractor",
+  "data": { "type": "TEMPLATE_NOT_FOUND" }
+}
+```
+
 ## Using Templates in API Calls
 
 ### Request Parameters

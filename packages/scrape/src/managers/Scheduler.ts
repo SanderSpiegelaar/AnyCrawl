@@ -197,6 +197,42 @@ export class SchedulerManager {
     }
 
     /**
+     * True when at least one worker is consuming the shared "scheduler" queue —
+     * in-process or in a separate scheduler image connected to the same Redis.
+     * Unlike isSchedulerRunning() (a per-process flag), this answers the question
+     * that actually matters before enqueueing: will anyone run this job?
+     * Bounded by a timeout so a Redis outage degrades to "no consumer" instead of
+     * hanging the caller (ioredis buffers commands indefinitely while offline).
+     */
+    public async hasSchedulerConsumer(timeoutMs = 3000): Promise<boolean> {
+        try {
+            const queue = this.schedulerQueue ?? QueueManager.getInstance().getQueue(this.SCHEDULER_QUEUE_NAME);
+            let timer: NodeJS.Timeout | undefined;
+            try {
+                const workers = await Promise.race([
+                    queue.getWorkers(),
+                    new Promise<never>((_, reject) => {
+                        timer = setTimeout(() => reject(new Error("scheduler consumer probe timed out")), timeoutMs);
+                        timer.unref?.();
+                    }),
+                ]);
+                return Array.isArray(workers) && workers.length > 0;
+            } finally {
+                if (timer) clearTimeout(timer);
+            }
+        } catch (error) {
+            // Timeout → Redis unreachable → honestly report "no consumer" (503).
+            // Any OTHER error (e.g. an ACL-restricted Redis rejecting CLIENT LIST
+            // with NOPERM) means we cannot tell — fail OPEN so a healthy scheduler
+            // behind a restricted Redis isn't wrongly reported unavailable; the
+            // enqueue itself is still bounded by triggerTaskNow's timeout.
+            const timedOut = error instanceof Error && error.message.includes("probe timed out");
+            log.warning(`[SCHEDULER] Consumer probe ${timedOut ? "timed out" : "errored"}: ${error}`);
+            return !timedOut;
+        }
+    }
+
+    /**
      * Add or update a scheduled task as a BullMQ repeatable job
      */
     public async addScheduledTask(task: any): Promise<void> {
@@ -207,23 +243,28 @@ export class SchedulerManager {
         }
 
         try {
-            // Add as repeatable job
-            await this.schedulerQueue.add(
-                "scheduled-task",
+            // Upsert a job scheduler keyed by the task uuid. Using the uuid as the
+            // scheduler key lets removeScheduledTask() address it directly via
+            // removeJobScheduler(taskUuid) — the old add(..., { repeat }) path
+            // auto-generated an opaque key, which made targeted removal impossible.
+            await this.schedulerQueue.upsertJobScheduler(
+                task.uuid,
                 {
-                    taskUuid: task.uuid,
-                    taskName: task.name,
-                    taskType: task.taskType,
-                    taskPayload: task.taskPayload,
+                    pattern: task.cronExpression,
+                    tz: task.timezone || "UTC",
                 },
                 {
-                    jobId: `scheduled:${task.uuid}`,
-                    repeat: {
-                        pattern: task.cronExpression,
-                        tz: task.timezone || "UTC",
+                    name: "scheduled-task",
+                    data: {
+                        taskUuid: task.uuid,
+                        taskName: task.name,
+                        taskType: task.taskType,
+                        taskPayload: task.taskPayload,
                     },
-                    removeOnComplete: 100, // Keep last 100 completed jobs for debugging
-                    removeOnFail: 100,
+                    opts: {
+                        removeOnComplete: 100, // Keep last 100 completed jobs for debugging
+                        removeOnFail: 100,
+                    },
                 }
             );
 
@@ -242,57 +283,75 @@ export class SchedulerManager {
      * Used by the monitor on-demand /check endpoint.
      */
     public async triggerTaskNow(task: any): Promise<void> {
-        if (!this.schedulerQueue) {
-            throw new Error(
-                "Scheduler queue not initialized. Make sure to call start() first or set ANYCRAWL_SCHEDULER_ENABLED=true"
-            );
-        }
+        // Enqueue onto the shared Redis "scheduler" queue. This must work from the
+        // API process too, which never calls start() (the scheduler runs as a
+        // separate worker image), so fall back to QueueManager when this instance
+        // has no started scheduler queue of its own. The separate scheduler worker
+        // consumes the job regardless of which process enqueued it.
+        const queue = this.schedulerQueue ?? QueueManager.getInstance().getQueue(this.SCHEDULER_QUEUE_NAME);
 
-        await this.schedulerQueue.add(
-            "scheduled-task",
-            {
-                taskUuid: task.uuid,
-                taskName: task.name,
-                taskType: task.taskType,
-                taskPayload: task.taskPayload,
-                triggeredBy: "manual",
-            },
-            {
-                // randomUUID suffix prevents two /check calls in the same millisecond
-                // from producing an identical BullMQ jobId (which would be silently deduped).
-                jobId: `manual:${task.uuid}:${Date.now()}:${randomUUID()}`,
-                removeOnComplete: 100,
-                removeOnFail: 100,
-            }
-        );
+        // Bound the enqueue with a timeout: when Redis is down, ioredis buffers
+        // commands indefinitely, which would hang the caller forever. Callers
+        // already try/catch, so a clear rejection is the right degradation.
+        let timer: NodeJS.Timeout | undefined;
+        try {
+            await Promise.race([
+                queue.add(
+                    "scheduled-task",
+                    {
+                        taskUuid: task.uuid,
+                        taskName: task.name,
+                        taskType: task.taskType,
+                        taskPayload: task.taskPayload,
+                        triggeredBy: "manual",
+                    },
+                    {
+                        // Time-bucketed jobId: bursts of /check calls within the same
+                        // 10s window map to one BullMQ jobId and are silently deduped
+                        // into a single run. The /check dedup guard only sees
+                        // task_executions rows, which the scheduler worker creates
+                        // seconds later — without this, N parallel calls (there is no
+                        // API-level rate limit) become N scrapes and N charges. It also
+                        // neutralizes the enqueue-timeout race: a retry after a timed-out
+                        // add that actually landed dedupes instead of double-firing.
+                        jobId: `manual:${task.uuid}:${Math.floor(Date.now() / 10_000)}`,
+                        removeOnComplete: 100,
+                        removeOnFail: 100,
+                    }
+                ),
+                new Promise<never>((_, reject) => {
+                    timer = setTimeout(
+                        () => reject(new Error("scheduler enqueue timed out — Redis unreachable?")),
+                        5000
+                    );
+                    timer.unref?.();
+                }),
+            ]);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
 
         log.info(`[SCHEDULER] ▶️ Manual trigger for task: ${task.name}`);
     }
 
     /**
-     * Remove a scheduled task from BullMQ repeatable jobs
+     * Remove a scheduled task from BullMQ job schedulers.
+     * Schedulers are keyed by the task uuid (see addScheduledTask), so removal is a
+     * direct removeJobScheduler(taskUuid) — no iteration or job-id reconstruction.
+     * Works from the API process too (which never calls start()) by falling back to
+     * QueueManager for the shared Redis "scheduler" queue, same as triggerTaskNow.
      * Note: This is a best-effort removal. Full cleanup happens in syncScheduledTasks.
      */
     public async removeScheduledTask(taskUuid: string): Promise<void> {
-        if (!this.schedulerQueue) {
-            return;
-        }
+        const queue = this.schedulerQueue ?? QueueManager.getInstance().getQueue(this.SCHEDULER_QUEUE_NAME);
 
         try {
-            // Get all job schedulers and find the one for this task
-            const jobSchedulers = await this.schedulerQueue.getJobSchedulers();
-
-            for (const scheduler of jobSchedulers) {
-                // Get the next job for this scheduler to check its data
-                const nextJob = await this.schedulerQueue.getJob(`repeat:${scheduler.key}`);
-                if (nextJob?.data?.taskUuid === taskUuid) {
-                    await this.schedulerQueue.removeJobScheduler(scheduler.key);
-                    log.debug(`[SCHEDULER] Removed job scheduler for task ${taskUuid}`);
-                    return;
-                }
+            const removed = await queue.removeJobScheduler(taskUuid);
+            if (removed) {
+                log.debug(`[SCHEDULER] Removed job scheduler for task ${taskUuid}`);
+            } else {
+                log.debug(`[SCHEDULER] No scheduler found for task: ${taskUuid}`);
             }
-
-            log.debug(`[SCHEDULER] No scheduler found for task: ${taskUuid}`);
         } catch (error) {
             log.error(`[SCHEDULER] Failed to remove scheduled task ${taskUuid}: ${error}`);
         }
@@ -649,15 +708,23 @@ export class SchedulerManager {
             jobUuid = triggerResult.jobUuid;
             executionDispatched = triggerResult.dispatchCommitted;
 
-            // Best effort: for async jobs, move pending -> running and attach job UUID.
-            // For sync search/map tasks, execution may already be completed/failed, so this can no-op.
+            // Attach the job UUID unconditionally, then move pending -> running as a
+            // separate guarded step. A fast scrape can finalize the execution before
+            // this code runs — if jobUuid rode on the guarded update it would be lost,
+            // and the monitor post-processor (which resolves job results via
+            // task_executions.jobUuid) would silently skip the snapshot.
             try {
+                if (jobUuid) {
+                    await db
+                        .update(schemas.taskExecutions)
+                        .set({ jobUuid: jobUuid })
+                        .where(eq(schemas.taskExecutions.uuid, executionUuid));
+                }
+                // Status transition stays guarded: sync search/map tasks may already
+                // be completed/failed, and a terminal state must never regress.
                 await db
                     .update(schemas.taskExecutions)
-                    .set({
-                        jobUuid: jobUuid,
-                        status: "running",
-                    })
+                    .set({ status: "running" })
                     .where(
                         sql`${schemas.taskExecutions.uuid} = ${executionUuid}
                             AND ${schemas.taskExecutions.status} = 'pending'`
@@ -977,6 +1044,28 @@ export class SchedulerManager {
             } catch (error) {
                 log.error(`[SCHEDULER] Failed to fetch template ${rawTemplateRef}: ${error}`);
                 throw error;
+            }
+        }
+
+        // Resolve the virtual "auto" engine to a concrete engine BEFORE building the
+        // queue name. The live scrape/crawl controllers call resolveAutoEngine before
+        // enqueue; the scheduler previously did not, so scheduled tasks with engine
+        // "auto" were dispatched to a "<type>-auto" queue that has no worker. The job
+        // was never consumed and the execution was later reaped as a failure — this is
+        // why monitors (which default to "auto") produced failed runs and empty detail.
+        if (engine === "auto" && (actualTaskType === "scrape" || actualTaskType === "crawl") && payload.url) {
+            try {
+                const { resolveAutoEngine } = await import("../utils/autoEngine.js");
+                // Crawl payloads carry the proxy under options.scrape_options; scrape
+                // payloads carry it under options directly. Check both.
+                engine = await resolveAutoEngine(
+                    payload.url,
+                    payload.options?.proxy ?? payload.options?.scrape_options?.proxy
+                );
+                log.info(`[SCHEDULER] Resolved auto engine for ${payload.url} -> ${engine}`);
+            } catch (error) {
+                engine = "playwright";
+                log.warning(`[SCHEDULER] Auto engine resolution failed for ${payload.url}, falling back to ${engine}: ${error}`);
             }
         }
 

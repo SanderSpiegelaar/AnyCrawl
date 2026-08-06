@@ -19,6 +19,7 @@ import {
     getOwnedMonitor,
     listMonitorsByOwner,
     listSnapshotsByMonitor,
+    getSnapshotForMonitor,
     listChangesByMonitor,
 } from "@anycrawl/db";
 import { randomUUID } from "crypto";
@@ -37,11 +38,20 @@ function buildTaskPayload(
     goal: string | undefined,
     diffOptions: any
 ): any {
-    const formats = trackMode === "text" ? ["markdown"] : ["markdown", "json"];
+    const requiredFormats = trackMode === "text" ? ["markdown"] : ["markdown", "json"];
+    const userOptions: any = target.options ?? {};
     const options: any = {
-        formats,
         only_main_content: diffOptions?.only_main_content ?? true,
-        ...(target.options ?? {}),
+        ...userOptions,
+        // Required formats must survive user-supplied target.options — losing
+        // "markdown" (or "json" in price mode) would make every check normalize
+        // to empty content and the monitor would report "same" forever.
+        formats: Array.from(
+            new Set([
+                ...(Array.isArray(userOptions.formats) ? userOptions.formats : []),
+                ...requiredFormats,
+            ])
+        ),
     };
     if ((trackMode === "json" || trackMode === "mixed") && extractSchema) {
         options.json_options = {
@@ -83,72 +93,101 @@ export class MonitorController {
                 validated.cron_expression,
                 validated.timezone
             );
+            // A monitor stored without a computable next execution would never run —
+            // fail loudly instead of returning 201 with next_execution_at: undefined.
+            if (!nextExecution) {
+                res.status(400).json({
+                    success: false,
+                    error: "cron_expression and timezone produced no future execution time",
+                });
+                return;
+            }
 
             const db = await getDB();
             const scheduledTaskUuid = randomUUID();
             const monitorUuid = randomUUID();
 
-            // 1. Backing scheduled task
-            await db.insert(schemas.scheduledTasks).values({
-                uuid: scheduledTaskUuid,
-                apiKey: apiKeyId,
-                userId: userId || null,
-                name: `[monitor] ${validated.name}`,
-                description: validated.description,
-                cronExpression: validated.cron_expression,
-                timezone: validated.timezone,
-                taskType: "scrape",
-                taskPayload,
-                concurrencyMode: validated.concurrency_mode,
-                maxExecutionsPerDay: validated.max_executions_per_day,
-                minCreditsRequired,
-                isActive: true,
-                isPaused: false,
-                nextExecutionAt: nextExecution,
-                tags: validated.tags,
-                metadata: { ...(validated.metadata ?? {}), monitorManaged: true, monitorUuid },
-                createdAt: new Date(),
-                updatedAt: new Date(),
+            // Task + monitor rows must land together: a task without its monitor row
+            // would keep firing and billing while being invisible in both UIs (the
+            // scheduled-tasks list hides monitor-managed rows).
+            await db.transaction(async (tx: any) => {
+                // 1. Backing scheduled task
+                await tx.insert(schemas.scheduledTasks).values({
+                    uuid: scheduledTaskUuid,
+                    apiKey: apiKeyId,
+                    userId: userId || null,
+                    name: `[monitor] ${validated.name}`,
+                    description: validated.description,
+                    cronExpression: validated.cron_expression,
+                    timezone: validated.timezone,
+                    taskType: "scrape",
+                    taskPayload,
+                    concurrencyMode: validated.concurrency_mode,
+                    maxExecutionsPerDay: validated.max_executions_per_day,
+                    minCreditsRequired,
+                    isActive: true,
+                    isPaused: false,
+                    nextExecutionAt: nextExecution,
+                    tags: validated.tags,
+                    metadata: { ...(validated.metadata ?? {}), monitorManaged: true, monitorUuid },
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+
+                // 2. Monitor row
+                await tx.insert(schemas.monitors).values({
+                    uuid: monitorUuid,
+                    apiKey: apiKeyId,
+                    userId: userId || null,
+                    name: validated.name,
+                    description: validated.description,
+                    monitorType: validated.monitor_type,
+                    scheduledTaskUuid,
+                    targets: validated.targets,
+                    goal: validated.goal,
+                    trackMode,
+                    extractSchema: validated.extract_schema ?? null,
+                    diffOptions: validated.diff_options ?? null,
+                    notifyOptions: validated.notify_options ?? { channels: ["webhook"], only_meaningful: true },
+                    isActive: true,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
             });
 
-            // 2. Monitor row
-            await db.insert(schemas.monitors).values({
-                uuid: monitorUuid,
-                apiKey: apiKeyId,
-                userId: userId || null,
-                name: validated.name,
-                description: validated.description,
-                monitorType: validated.monitor_type,
-                scheduledTaskUuid,
-                targets: validated.targets,
-                goal: validated.goal,
-                trackMode,
-                extractSchema: validated.extract_schema ?? null,
-                diffOptions: validated.diff_options ?? null,
-                notifyOptions: validated.notify_options ?? { channels: ["webhook"], only_meaningful: true },
-                isActive: true,
-                createdAt: new Date(),
-                updatedAt: new Date(),
-            });
-
-            // 3. Register with the scheduler if it's running
+            // 3. Register the recurring cron and trigger the first check immediately,
+            //    so a newly created monitor produces a baseline snapshot right away
+            //    instead of waiting for the first cron slot. triggerTaskNow enqueues
+            //    onto the shared Redis "scheduler" queue, so it works even when the
+            //    scheduler runs as a separate worker image (this API process does not
+            //    run the scheduler in-process).
             try {
                 const { SchedulerManager } = await import("@anycrawl/scrape");
                 const scheduler = SchedulerManager.getInstance();
-                if (scheduler.isSchedulerRunning()) {
-                    const createdTask = await db
-                        .select()
-                        .from(schemas.scheduledTasks)
-                        .where(eq(schemas.scheduledTasks.uuid, scheduledTaskUuid))
-                        .limit(1);
-                    if (createdTask.length > 0) {
+                const createdTask = await db
+                    .select()
+                    .from(schemas.scheduledTasks)
+                    .where(eq(schemas.scheduledTasks.uuid, scheduledTaskUuid))
+                    .limit(1);
+                if (createdTask.length > 0) {
+                    // When the scheduler runs in this process, register the repeatable
+                    // cron now; otherwise the separate worker picks it up via polling.
+                    if (scheduler.isSchedulerRunning()) {
                         await scheduler.addScheduledTask(createdTask[0]);
                     }
-                } else {
-                    log.debug("Monitor created. Scheduler worker will sync via polling.");
+                    // Immediate first check — but only when a scheduler worker is
+                    // actually consuming the queue. Enqueueing without a consumer
+                    // would strand the job until a scheduler starts, then fire it
+                    // at an arbitrary later time. The cron registration above (or
+                    // worker polling) still covers the recurring schedule.
+                    if (await scheduler.hasSchedulerConsumer()) {
+                        await scheduler.triggerTaskNow(createdTask[0]);
+                    } else {
+                        log.debug("Monitor created without immediate first check: no scheduler consumer detected.");
+                    }
                 }
             } catch (error) {
-                log.warning(`Failed to add monitor task to scheduler: ${error}`);
+                log.warning(`Failed to schedule/trigger monitor task: ${error}`);
             }
 
             res.status(201).json({
@@ -226,6 +265,24 @@ export class MonitorController {
             const newTrackMode = validated.track_mode ?? monitor.trackMode;
             if (validated.track_mode !== undefined) monitorUpdate.trackMode = validated.track_mode;
 
+            // Merge-time guard (the zod schema cannot see the stored row): json/mixed
+            // tracking without any extract schema would scrape a "json" format with
+            // nothing to extract and the diff step could never detect anything.
+            const effectiveExtractSchema = validated.extract_schema ?? monitor.extractSchema;
+            if ((newTrackMode === "json" || newTrackMode === "mixed") && !effectiveExtractSchema) {
+                res.status(400).json({
+                    success: false,
+                    error: "extract_schema is required when track_mode is 'json' or 'mixed'",
+                    details: [
+                        {
+                            field: "extract_schema",
+                            message: "extract_schema is required when track_mode is 'json' or 'mixed'",
+                        },
+                    ],
+                });
+                return;
+            }
+
             await db.update(schemas.monitors).set(monitorUpdate).where(eq(schemas.monitors.uuid, id));
 
             // Propagate to backing scheduled task when scheduling/payload inputs changed
@@ -239,7 +296,28 @@ export class MonitorController {
                 );
                 taskChanged = true;
             }
-            if (validated.timezone) { taskUpdate.timezone = validated.timezone; taskChanged = true; }
+            if (validated.timezone) {
+                taskUpdate.timezone = validated.timezone;
+                // A timezone change shifts when the same cron next fires — recompute
+                // even when cron_expression itself is untouched (the block above only
+                // recomputes when cron changes).
+                if (!validated.cron_expression && monitor.cronExpression) {
+                    taskUpdate.nextExecutionAt = this.calculateNextExecution(
+                        monitor.cronExpression,
+                        validated.timezone
+                    );
+                }
+                taskChanged = true;
+            }
+            if (validated.is_active !== undefined) {
+                // Keep the backing task in lockstep with monitor active state, exactly
+                // like the dedicated /pause and /resume endpoints — otherwise the task
+                // keeps firing (and billing) while the monitor reads as inactive.
+                taskUpdate.isPaused = !validated.is_active;
+                taskUpdate.pauseReason = validated.is_active ? null : "Paused by user (monitor)";
+                if (validated.is_active) taskUpdate.consecutiveFailures = 0;
+                taskChanged = true;
+            }
             if (validated.concurrency_mode) { taskUpdate.concurrencyMode = validated.concurrency_mode; taskChanged = true; }
             if (validated.max_executions_per_day !== undefined) { taskUpdate.maxExecutionsPerDay = validated.max_executions_per_day; taskChanged = true; }
             if (validated.targets || validated.extract_schema !== undefined || validated.goal !== undefined || validated.track_mode !== undefined || validated.diff_options !== undefined) {
@@ -295,12 +373,17 @@ export class MonitorController {
                 return;
             }
 
-            // Deleting the monitor first (FK cascade removes snapshots + changes)
-            await db.delete(schemas.monitors).where(eq(schemas.monitors.uuid, id));
+            // Monitor + backing task must go together — a surviving task would keep
+            // firing and billing while hidden from the scheduled-tasks list.
+            await db.transaction(async (tx: any) => {
+                // Deleting the monitor first (FK cascade removes snapshots + changes)
+                await tx.delete(schemas.monitors).where(eq(schemas.monitors.uuid, id));
+                if (monitor.scheduledTaskUuid) {
+                    await tx.delete(schemas.scheduledTasks).where(eq(schemas.scheduledTasks.uuid, monitor.scheduledTaskUuid));
+                }
+            });
 
-            // Then remove the backing scheduled task
             if (monitor.scheduledTaskUuid) {
-                await db.delete(schemas.scheduledTasks).where(eq(schemas.scheduledTasks.uuid, monitor.scheduledTaskUuid));
                 try {
                     const { SchedulerManager } = await import("@anycrawl/scrape");
                     await SchedulerManager.getInstance().removeScheduledTask(monitor.scheduledTaskUuid);
@@ -418,6 +501,17 @@ export class MonitorController {
                 return;
             }
 
+            // A paused/inactive monitor would 202 here but the worker silently drops
+            // the job at the isPaused re-check — surface the real state instead of a
+            // spinner that never completes.
+            if (!monitor.isActive || taskRows[0].isPaused) {
+                res.status(409).json({
+                    success: false,
+                    error: "Monitor is paused. Resume it before triggering a check.",
+                });
+                return;
+            }
+
             // Dedup guard: reject if a run is already pending/running for this monitor's
             // task. Prevents a client from flooding the queue via repeated /check calls.
             const inFlight = await db
@@ -437,9 +531,16 @@ export class MonitorController {
             }
 
             try {
+                // Enqueue a one-off run onto the shared Redis "scheduler" queue. The
+                // API process does not run the scheduler itself (separate worker
+                // image), so gate on an actual queue consumer — NOT the in-process
+                // "is running" flag, which is always false here and used to make
+                // /check return 503 unconditionally in split deployments. Without a
+                // consumer a 202 would be a lie: the job would sit queued forever
+                // (and burst-execute when a scheduler finally starts).
                 const { SchedulerManager } = await import("@anycrawl/scrape");
                 const scheduler = SchedulerManager.getInstance();
-                if (!scheduler.isSchedulerRunning()) {
+                if (!(await scheduler.hasSchedulerConsumer())) {
                     res.status(503).json({ success: false, error: "Scheduler is not running; cannot trigger on-demand check" });
                     return;
                 }
@@ -478,6 +579,34 @@ export class MonitorController {
             );
             const rows = await listSnapshotsByMonitor(db, id!, offset, limit);
             res.json({ success: true, data: serializeRecords(rows) });
+        } catch (error) {
+            this.handleError(error, res);
+        }
+    };
+
+    /**
+     * Get a single snapshot with the full content/extracted payload. The
+     * snapshots list intentionally omits these heavy columns — this endpoint
+     * is the only way to read them.
+     */
+    public snapshotDetail = async (req: RequestWithAuth, res: Response): Promise<void> => {
+        try {
+            const { id, snapshotId } = req.params;
+            const owner = this.getOwnerContext(req);
+            const db = await getDB();
+
+            const monitor = await getOwnedMonitor(db, id!, owner);
+            if (!monitor) {
+                res.status(404).json({ success: false, error: "Monitor not found" });
+                return;
+            }
+
+            const snapshot = await getSnapshotForMonitor(db, id!, snapshotId!);
+            if (!snapshot) {
+                res.status(404).json({ success: false, error: "Snapshot not found" });
+                return;
+            }
+            res.json({ success: true, data: serializeRecord(snapshot) });
         } catch (error) {
             this.handleError(error, res);
         }

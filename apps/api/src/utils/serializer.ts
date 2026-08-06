@@ -11,41 +11,35 @@ function camelToSnake(str: string): string {
 }
 
 /**
- * Convert an object's keys from camelCase to snake_case recursively
+ * Convert an object's TOP-LEVEL keys from camelCase to snake_case.
+ *
+ * Deliberately shallow: only column names are ours to rename. Nested values are
+ * JSONB payloads whose keys belong to the user (extract_schema properties,
+ * extracted data, metadata, task payloads) — recursing into them corrupted
+ * user-defined keys (e.g. an extract field `salePrice` became `sale_price`,
+ * `Price` became `_price`) and the mangled shape round-tripped back into the DB
+ * on the next dashboard save. JSONB written by our own API handlers is already
+ * snake_case at rest, so it needs no conversion here either.
  */
 export function toSnakeCase<T = any>(obj: any): T {
     if (obj === null || obj === undefined) {
         return obj;
     }
 
-    // Handle arrays
+    // Arrays of records (list responses)
     if (Array.isArray(obj)) {
         return obj.map((item) => toSnakeCase(item)) as any;
     }
 
-    // Handle Date objects
-    if (obj instanceof Date) {
+    // Dates and primitives pass through
+    if (typeof obj !== "object" || obj instanceof Date) {
         return obj as any;
     }
 
-    // Handle primitive types
-    if (typeof obj !== "object") {
-        return obj;
-    }
-
-    // Handle objects
     const result: any = {};
     for (const key in obj) {
         if (Object.prototype.hasOwnProperty.call(obj, key)) {
-            const snakeKey = camelToSnake(key);
-            const value = obj[key];
-
-            // Recursively convert nested objects and arrays
-            if (value !== null && typeof value === "object" && !(value instanceof Date)) {
-                result[snakeKey] = toSnakeCase(value);
-            } else {
-                result[snakeKey] = value;
-            }
+            result[camelToSnake(key)] = obj[key];
         }
     }
 

@@ -152,18 +152,30 @@ export async function finalizeExecution(input: FinalizeExecutionInput): Promise<
         }
     }
 
-    // Monitor post-processing: diff content and fire notifications on successful transitions.
+    // Monitor post-processing: diff content and fire notifications on successful
+    // transitions; record an error snapshot + monitor.error event on failures so a
+    // failed check is visible in the monitor detail instead of silently missing.
     // Dynamic import keeps this module free of circular-dependency and is zero-cost for
     // the majority of executions that do not belong to a monitor.
-    if (transitioned && input.status === "completed" && scheduledTaskUuid) {
+    if (transitioned && scheduledTaskUuid) {
         try {
             const { MonitorPostProcessor } = await import("../monitor/MonitorPostProcessor.js");
-            await MonitorPostProcessor.process({
-                db,
-                scheduledTaskUuid,
-                executionUuid: input.executionUuid,
-                jobUuid: input.jobUuid,
-            });
+            if (input.status === "completed") {
+                await MonitorPostProcessor.process({
+                    db,
+                    scheduledTaskUuid,
+                    executionUuid: input.executionUuid,
+                    jobUuid: input.jobUuid,
+                });
+            } else if (input.status === "failed") {
+                await MonitorPostProcessor.processFailure({
+                    db,
+                    scheduledTaskUuid,
+                    executionUuid: input.executionUuid,
+                    errorMessage: input.errorMessage,
+                    errorCode: input.errorCode,
+                });
+            }
         } catch (e) {
             log.warning(`[MONITOR] post-process dispatch failed for execution ${input.executionUuid}: ${e}`);
         }

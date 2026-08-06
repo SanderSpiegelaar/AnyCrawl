@@ -266,6 +266,43 @@ Discovers all URLs from a website using multiple sources:
 
 Returns `MapResult` with `links` array containing `{ url, title?, description? }` objects.
 
+### template(ref)
+
+Call a template through its own dedicated endpoint instead of passing `template_id` in a scrape/search/crawl body. `ref` is the template's vanity slug (preferred) or its `templateId`. Returns a small handle bound to `ref` with `execute` and `spec`.
+
+```ts
+const t = client.template("content-extractor"); // slug or templateId
+
+// Discover the call-spec (free — never billed). Returns TemplateSpec.
+const spec = await t.spec();
+// spec.template_type -> "scrape" | "search" | "crawl"
+// spec.variables, spec.pricing, spec.allowed_domains, spec.endpoint
+
+// Execute. Body accepts only url / query / variables — every other option
+// comes from the template. Return type depends on the template type.
+const result = await t.execute({
+    url: "https://example.com", // use `query` for search templates
+    variables: { category: "tech" },
+});
+```
+
+The result of `execute()` is `TemplateExecuteResult`, discriminated by the template type:
+
+- **scrape** → `ScrapeResult` (synchronous)
+- **search** → `SearchResult[]` (synchronous)
+- **crawl** → `CrawlJobResponse` (`{ job_id, status, message }`) — async; poll with `client.getCrawlStatus(job_id)` / `client.getCrawlResults(job_id)` (or `client.crawl(...)`)
+
+```ts
+// Crawl template: async job, then poll
+const job = await client.template("docs-crawler").execute({ url: "https://docs.example.com" });
+if ("job_id" in job) {
+    const status = await client.getCrawlStatus(job.job_id);
+    const page = await client.getCrawlResults(job.job_id, 0);
+}
+```
+
+Errors mirror the underlying delegated call plus template-specific cases: `404` (template not found or no access), `403` (URL not allowed by the template's domain policy), `400` (missing/invalid variables). See [Error handling](#error-handling).
+
 ### Scheduled Tasks
 
 ```ts
@@ -419,6 +456,7 @@ Notes:
 - `cancelCrawl(jobId: string): Promise<{ job_id: string; status: string }>`
 - `search(input: SearchRequest): Promise<SearchResult[]>`
 - `map(input: MapRequest): Promise<MapResult>`
+- `template(ref: string): { execute(input?: TemplateExecuteRequest): Promise<TemplateExecuteResult>; spec(): Promise<TemplateSpec> }`
 
 **Scheduled Tasks**
 - `createScheduledTask(input): Promise<ScheduledTaskCreateResponse>`

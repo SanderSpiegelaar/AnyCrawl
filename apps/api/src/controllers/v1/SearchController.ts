@@ -4,7 +4,8 @@ import { SearchService, getSearchConfig } from "@anycrawl/search/SearchService";
 import { log } from "@anycrawl/libs/log";
 import { searchSchema, RequestWithAuth, CreditCalculator, WebhookEventType, estimateTaskCredits, getCacheConfig, appConfig } from "@anycrawl/libs";
 import { randomUUID } from "crypto";
-import { STATUS, createJob, insertJobResult, completedJob, failedJob, updateJobCounts, updateJobCacheHits, JOB_RESULT_STATUS } from "@anycrawl/db";
+import { STATUS, createJob, insertJobResult, completedJob, failedJob, updateJobCounts, updateJobCacheHits, JOB_RESULT_STATUS, writeResultToDataset, assertDatasetWritable, parseDatasetOutput, standardDatasetMapping, DatasetWriteError, type ParsedDatasetOutput, type DatasetMapping } from "@anycrawl/db";
+import type { OwnerContext } from "@anycrawl/libs";
 import { QueueManager, CacheManager } from "@anycrawl/scrape";
 import { TemplateHandler, validateVariables, applyVariableDefaults } from "../../utils/templateHandler.js";
 import { validateTemplateOnlyFields } from "../../utils/templateValidator.js";
@@ -24,6 +25,42 @@ export class SearchController {
         log.info("SearchController initialized");
     }
 
+    /**
+     * Run the Dataset Writer for the assembled search results and return the
+     * `dataset` splice. Fail-closed: Writer errors become `{ status: "failed" }`
+     * so search data is never dropped and the response never becomes a 500.
+     */
+    private writeDatasetSafe = async (args: {
+        datasetOutput: ParsedDatasetOutput;
+        mapping: DatasetMapping;
+        owner: OwnerContext;
+        jobId: string;
+        result: unknown;
+    }): Promise<Record<string, unknown>> => {
+        try {
+            const outcome = await writeResultToDataset({
+                producerType: "search",
+                producerId: args.jobId,
+                jobId: args.jobId,
+                scope: { kind: "job", jobId: args.jobId },
+                scopeType: "search",
+                result: args.result,
+                mapping: args.mapping,
+                owner: args.owner,
+                dataset: args.datasetOutput.dataset,
+            });
+            return {
+                dataset_id: outcome.datasetId,
+                dataset_run_id: outcome.datasetRunId,
+                status: outcome.status,
+            };
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            log.warning(`[SEARCH] Dataset write failed for job ${args.jobId}: ${message}`);
+            return { status: "failed", warning: message };
+        }
+    };
+
     public handle = async (req: RequestWithAuth, res: Response): Promise<void> => {
         let searchJobId: string | null = null;
         let engineName: string | null = null;
@@ -31,6 +68,11 @@ export class SearchController {
         /** Search-template metadata: when false, do not bill scrape template perCall for follow-up scrapes. */
         let chargeScrapeTemplateCreditsForFollowup = true;
         try {
+            // Dataset output is an additive, non-schema field: capture from the raw
+            // body up front, then strip it before schema parsing so the no-dataset
+            // path is unchanged.
+            const rawDatasetOutput = (req.body && typeof req.body === "object") ? (req.body as any).output : undefined;
+
             // Merge template options with request body before parsing
             let requestData = { ...req.body };
 
@@ -63,8 +105,31 @@ export class SearchController {
                 }
             } catch { /* ignore render errors; schema will validate later */ }
 
+            // Never feed `output` to the search schema (unknown keys are stripped,
+            // but strip explicitly to keep intent clear and behavior stable).
+            if (requestData && typeof requestData === "object") delete (requestData as any).output;
+
             // Validate and parse the merged data
             const validatedData = searchSchema.parse(requestData);
+
+            // Resolve the dataset output config (null unless output.dataset present).
+            const datasetOutput = parseDatasetOutput(rawDatasetOutput, { defaultName: `Search ${validatedData.query}` });
+            const datasetMapping = standardDatasetMapping("search");
+            const datasetOwner: OwnerContext = { apiKeyId: req.auth?.uuid, userId: req.auth?.user };
+            if (datasetOutput) {
+                // Eagerly validate an existing dataset before running the search.
+                try {
+                    await assertDatasetWritable({ owner: datasetOwner, dataset: datasetOutput.dataset, mapping: datasetMapping });
+                } catch (dsError) {
+                    if (dsError instanceof DatasetWriteError) {
+                        req.creditsUsed = 0;
+                        req.billingChargeDetails = undefined;
+                        res.status(dsError.httpStatus).json({ success: false, error: dsError.code, message: dsError.message });
+                        return;
+                    }
+                    throw dsError;
+                }
+            }
 
             let mergedSearchScrapeOptions = validatedData.scrape_options;
             let scrapeFollowTemplatePerCall = 0;
@@ -437,10 +502,17 @@ export class SearchController {
             } catch (e) {
                 log.error(`Failed to mark job final status for job_id=${searchJobId}: ${e instanceof Error ? e.message : String(e)}`);
             }
-            res.json({
-                success: true,
-                data: results,
-            });
+            const searchResponse: Record<string, unknown> = { success: true, data: results };
+            if (datasetOutput) {
+                searchResponse.dataset = await this.writeDatasetSafe({
+                    datasetOutput,
+                    mapping: datasetMapping,
+                    owner: datasetOwner,
+                    jobId: searchJobId!,
+                    result: results,
+                });
+            }
+            res.json(searchResponse);
         } catch (error) {
             if (error instanceof z.ZodError) {
                 const formattedErrors = error.errors.map((err) => ({

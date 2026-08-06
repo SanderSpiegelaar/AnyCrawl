@@ -3,33 +3,25 @@ import { RequestWithAuth, appConfig } from "@anycrawl/libs";
 import { log } from "@anycrawl/libs/log";
 import { getDB, schemas, eq } from "@anycrawl/db";
 
-// Routes that require credit check (billing endpoints)
-const CREDIT_CHECK_ROUTES = [
-    { method: "POST", path: "/v1/scrape" },
-    { method: "POST", path: "/v1/batch/scrape" },
-    { method: "POST", path: "/v1/crawl" },
-    { method: "POST", path: "/v1/map" },
-    { method: "POST", path: "/v1/search" },
-];
-
-const shouldCheckCredits = (method: string, path: string): boolean => {
-    return CREDIT_CHECK_ROUTES.some((route) => {
-        return route.method === method && route.path === path;
-    });
-};
-
+/**
+ * Coarse credit pre-flight gate.
+ *
+ * Attach this as ROUTE-LEVEL middleware on every billing route (fail-closed): a route that can
+ * create a chargeable job must declare `checkCreditsMiddleware` at its definition, so new billing
+ * endpoints (e.g. /template/:ref/execute) cannot silently bypass the balance check. This replaces
+ * the old app-level mount + central path allowlist, which was fail-open — any unlisted billing
+ * path executed for free.
+ *
+ * The gate is action-agnostic: it only verifies `balance > 0`. The real amount is metered per job
+ * by DeductCreditsMiddleware, which also enforces a fail-closed invariant (chargeable request must
+ * have passed this gate).
+ */
 export const checkCreditsMiddleware = async (
     req: RequestWithAuth,
     res: Response,
     next: NextFunction
 ): Promise<void> => {
     if (!appConfig.authEnabled || !appConfig.creditsEnabled) {
-        next();
-        return;
-    }
-
-    // Only check credits for billing endpoints (scrape, crawl, map, search)
-    if (!shouldCheckCredits(req.method, req.path)) {
         next();
         return;
     }

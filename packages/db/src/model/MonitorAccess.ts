@@ -1,8 +1,25 @@
 import type { OwnerContext } from "@anycrawl/libs";
-import { eq, sql } from "drizzle-orm";
+import { eq, sql, getTableColumns } from "drizzle-orm";
 import { schemas } from "../db/index.js";
 
 type DBExecutor = any;
+
+/**
+ * Monitor columns plus the schedule/execution-timing fields that live on the
+ * backing scheduled_tasks row (cron, timezone, next/last execution). The monitor
+ * detail UI needs these, and they only exist on the task, so every monitor read
+ * left-joins the task and merges them in.
+ */
+function monitorSelection() {
+    return {
+        ...getTableColumns(schemas.monitors),
+        cronExpression: schemas.scheduledTasks.cronExpression,
+        timezone: schemas.scheduledTasks.timezone,
+        nextExecutionAt: schemas.scheduledTasks.nextExecutionAt,
+        lastExecutionAt: schemas.scheduledTasks.lastExecutionAt,
+        isPaused: schemas.scheduledTasks.isPaused,
+    };
+}
 
 export function buildMonitorWhereClause(monitorId: string, owner: OwnerContext): any {
     if (owner.userId) {
@@ -19,8 +36,12 @@ export function buildMonitorWhereClause(monitorId: string, owner: OwnerContext):
 export async function getOwnedMonitor(db: DBExecutor, monitorId: string, owner: OwnerContext): Promise<any | null> {
     const whereClause = buildMonitorWhereClause(monitorId, owner);
     const monitors = await db
-        .select()
+        .select(monitorSelection())
         .from(schemas.monitors)
+        .leftJoin(
+            schemas.scheduledTasks,
+            eq(schemas.monitors.scheduledTaskUuid, schemas.scheduledTasks.uuid)
+        )
         .where(whereClause)
         .limit(1);
 
@@ -28,26 +49,27 @@ export async function getOwnedMonitor(db: DBExecutor, monitorId: string, owner: 
 }
 
 export async function listMonitorsByOwner(db: DBExecutor, owner: OwnerContext): Promise<any[]> {
+    const query = db
+        .select(monitorSelection())
+        .from(schemas.monitors)
+        .leftJoin(
+            schemas.scheduledTasks,
+            eq(schemas.monitors.scheduledTaskUuid, schemas.scheduledTasks.uuid)
+        );
+
     if (owner.userId) {
-        return await db
-            .select()
-            .from(schemas.monitors)
+        return await query
             .where(eq(schemas.monitors.userId, owner.userId))
             .orderBy(sql`${schemas.monitors.createdAt} DESC`);
     }
 
     if (owner.apiKeyId) {
-        return await db
-            .select()
-            .from(schemas.monitors)
+        return await query
             .where(eq(schemas.monitors.apiKey, owner.apiKeyId))
             .orderBy(sql`${schemas.monitors.createdAt} DESC`);
     }
 
-    return await db
-        .select()
-        .from(schemas.monitors)
-        .orderBy(sql`${schemas.monitors.createdAt} DESC`);
+    return await query.orderBy(sql`${schemas.monitors.createdAt} DESC`);
 }
 
 /**
@@ -74,7 +96,10 @@ export async function getLatestSnapshot(db: DBExecutor, monitorUuid: string, url
         .select()
         .from(schemas.monitorSnapshots)
         .where(
-            sql`${schemas.monitorSnapshots.monitorUuid} = ${monitorUuid} AND ${schemas.monitorSnapshots.url} = ${url}`
+            // 'error' snapshots record failed checks for visibility only — they carry
+            // no content and must never serve as the diff baseline, or the next
+            // successful check would false-alert against an empty hash.
+            sql`${schemas.monitorSnapshots.monitorUuid} = ${monitorUuid} AND ${schemas.monitorSnapshots.url} = ${url} AND ${schemas.monitorSnapshots.status} != 'error'`
         )
         .orderBy(sql`${schemas.monitorSnapshots.capturedAt} DESC`)
         .limit(1);
@@ -82,6 +107,12 @@ export async function getLatestSnapshot(db: DBExecutor, monitorUuid: string, url
     return rows[0] || null;
 }
 
+/**
+ * List rows deliberately exclude the heavy columns (`content` up to 256KB,
+ * `extracted`): the dashboard polls this list every few seconds with limit 50,
+ * which shipped ~12.8MB per poll when full rows were returned. Full payloads
+ * are served per-snapshot via getSnapshotForMonitor.
+ */
 export async function listSnapshotsByMonitor(
     db: DBExecutor,
     monitorUuid: string,
@@ -89,12 +120,41 @@ export async function listSnapshotsByMonitor(
     limit: number
 ): Promise<any[]> {
     return await db
-        .select()
+        .select({
+            uuid: schemas.monitorSnapshots.uuid,
+            monitorUuid: schemas.monitorSnapshots.monitorUuid,
+            taskExecutionUuid: schemas.monitorSnapshots.taskExecutionUuid,
+            url: schemas.monitorSnapshots.url,
+            contentHash: schemas.monitorSnapshots.contentHash,
+            status: schemas.monitorSnapshots.status,
+            capturedAt: schemas.monitorSnapshots.capturedAt,
+        })
         .from(schemas.monitorSnapshots)
         .where(eq(schemas.monitorSnapshots.monitorUuid, monitorUuid))
         .orderBy(sql`${schemas.monitorSnapshots.capturedAt} DESC`)
         .limit(limit)
         .offset(skip);
+}
+
+/**
+ * Fetch one snapshot INCLUDING content/extracted, scoped to the monitor so a
+ * snapshot uuid from another monitor (or another owner's monitor) 404s at the
+ * controller instead of leaking content.
+ */
+export async function getSnapshotForMonitor(
+    db: DBExecutor,
+    monitorUuid: string,
+    snapshotUuid: string
+): Promise<any | null> {
+    const rows = await db
+        .select()
+        .from(schemas.monitorSnapshots)
+        .where(
+            sql`${schemas.monitorSnapshots.uuid} = ${snapshotUuid} AND ${schemas.monitorSnapshots.monitorUuid} = ${monitorUuid}`
+        )
+        .limit(1);
+
+    return rows[0] || null;
 }
 
 export async function listChangesByMonitor(

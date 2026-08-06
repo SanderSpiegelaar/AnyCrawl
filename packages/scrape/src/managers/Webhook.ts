@@ -81,14 +81,22 @@ export class WebhookManager {
         log.info("[WEBHOOK] ✅ Webhook Manager initialized successfully");
     }
 
+    /**
+     * Fan an event out to all matching subscriptions.
+     * Returns the number of deliveries actually enqueued — 0 means nothing was
+     * dispatched (no matching subscription, or a lookup failure). Callers that
+     * track delivery state (e.g. the monitor post-processor's `notified` flag)
+     * must check the count: this method never rejects.
+     */
     public async triggerEvent(
         eventType: string,
         payload: any,
         eventSource: string,
         eventSourceId: string,
         userId?: string
-    ): Promise<void> {
+    ): Promise<number> {
         const db = await getDB();
+        let enqueued = 0;
 
         try {
             // Find all active subscriptions for this event type
@@ -117,10 +125,13 @@ export class WebhookManager {
                 }
 
                 await this.enqueueDelivery(subscription, eventType, payload, eventSource, eventSourceId);
+                enqueued++;
             }
         } catch (error) {
             log.error(`[WEBHOOK] Failed to trigger webhook event ${eventType}: ${error}`);
         }
+
+        return enqueued;
     }
 
     private async enqueueDelivery(
