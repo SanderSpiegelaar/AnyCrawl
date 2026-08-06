@@ -12,6 +12,7 @@
         "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch --detectOpenHandles",
         "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --coverage --detectOpenHandles --forceExit",
         "create:test:template": "dotenv-run -r ../.. -- tsx ./src/scripts/run-create-template.ts",
+        "create:craigslist:template": "dotenv-run -r ../.. -- tsx ./src/templates/craigslist-all-in-one/run-create-craigslist-template.ts",
         "typecheck": "tsc --noEmit"
     },
     "exports": {

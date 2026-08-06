@@ -117,6 +117,17 @@ export interface TemplateConfig {
                 compiled?: string;
             };
         };
+        // Orchestrated runtime: seed builder handler (doc §7.2). Mirrors the
+        // requestHandler shape exactly; additive/optional. Absent/disabled in
+        // single (legacy) mode.
+        seedHandler?: {
+            enabled: boolean;
+            code: {
+                language: "javascript" | "typescript";
+                source: string;
+                compiled?: string;
+            };
+        };
         failedRequestHandler?: {
             enabled: boolean;
             code: {

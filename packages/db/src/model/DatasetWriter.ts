@@ -27,7 +27,7 @@ const PLATFORM_HASH_EXCLUDE_PATHS = [
     "/scrapedAt",
 ];
 
-export type DatasetScopeType = "scrape" | "crawl" | "search";
+export type DatasetScopeType = "scrape" | "crawl" | "search" | "orchestrated";
 
 export interface DatasetProjectionSpec {
     name: string;
@@ -185,6 +185,12 @@ export class DatasetWriter {
                 return { name: "anycrawl_crawl_page", version: "1.0.0" };
             case "search":
                 return { name: "anycrawl_search_result", version: "1.0.0" };
+            case "orchestrated":
+                // Default schema for orchestrated producers. Used only when the
+                // caller does not override `mapping`; orchestrated producers
+                // normally supply their own `itemsPath`/`itemKeyPath` (and often
+                // a template-declared outputSchema name/version) via `mapping`.
+                return { name: "anycrawl_orchestrated", version: "1.0.0" };
         }
     }
 

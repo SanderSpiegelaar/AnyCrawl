@@ -1,0 +1,363 @@
+{
+  "uuid": "c1a1e51a-0001-4a1e-8b01-c1a1e51a0001",
+  "templateId": "craigslist-all-in-one",
+  "slug": null,
+  "name": "Craigslist All-in-One",
+  "description": "Orchestrated Craigslist search-listing scraper. Guided cities x categories x queries expansion with price / hasPic / sort filters, automatic pagination, structured ListingSummary output, stable per-listing dedup and Dataset projections. Phase 1: search listings only (no detail pages).",
+  "tags": [
+    "craigslist",
+    "listings",
+    "marketplace",
+    "classifieds",
+    "search"
+  ],
+  "version": "1.0.0",
+  "pricing": {
+    "perCall": 1,
+    "currency": "credits"
+  },
+  "templateType": "scrape",
+  "reqOptions": {
+    "engine": "cheerio",
+    "formats": [
+      "rawHtml",
+      "html"
+    ],
+    "timeout": 30000,
+    "retry": true
+  },
+  "runtime": {
+    "mode": "orchestrated",
+    "handlerProtocolVersion": "1",
+    "seedBuilder": {
+      "type": "handler",
+      "name": "seedHandler"
+    },
+    "defaultRunOptions": {
+      "max_items": 1000,
+      "max_pages_per_seed": 10,
+      "max_concurrency": 5,
+      "max_run_time_seconds": 3600,
+      "max_seeds": 100
+    }
+  },
+  "outputSchema": {
+    "name": "craigslist_listing",
+    "version": "1.0.0",
+    "itemsPath": "/items",
+    "itemKeyPath": "/itemKey",
+    "hashExcludePaths": [
+      "/provenance/scrapedAt"
+    ],
+    "projections": [
+      {
+        "field": "id",
+        "path": "/id",
+        "type": "string"
+      },
+      {
+        "field": "title",
+        "path": "/title",
+        "type": "string"
+      },
+      {
+        "field": "priceAmount",
+        "path": "/price/amount",
+        "type": "number"
+      },
+      {
+        "field": "priceCurrency",
+        "path": "/price/currency",
+        "type": "string"
+      },
+      {
+        "field": "cityCode",
+        "path": "/location/cityCode",
+        "type": "string"
+      },
+      {
+        "field": "categoryCode",
+        "path": "/category/code",
+        "type": "string"
+      },
+      {
+        "field": "postedAt",
+        "path": "/postedAt",
+        "type": "timestamptz"
+      },
+      {
+        "field": "hasImage",
+        "path": "/hasImage",
+        "type": "boolean"
+      },
+      {
+        "field": "completeness",
+        "path": "/quality/completeness",
+        "type": "number"
+      },
+      {
+        "field": "scrapedAt",
+        "path": "/provenance/scrapedAt",
+        "type": "timestamptz"
+      }
+    ]
+  },
+  "customHandlers": {
+    "seedHandler": {
+      "enabled": true,
+      "code": {
+        "language": "javascript",
+        "source": "// craigslist-all-in-one :: seedHandler (orchestrated seed builder)\n//\n// This file is the readable / node-checkable mirror of\n//   craigslist-all-in-one.template.json -> customHandlers.seedHandler.code.source\n// The JSON embeds this exact text as an inline string; keep the two in sync\n// (verified by the template's build/verify step). The runtime executes this\n// body inside the non-trusted VM sandbox as an async function body, so it may\n// use top-level `return` and the sandbox globals `variables` and `template`.\n// Sandbox rules: no module loading, no process access, no DOM APIs. Only\n// standard ECMAScript intrinsics plus JSON / Math / Date / RegExp are available.\n//\n// Contract (docs/design/template-runs-datasets-platform.md 7.2):\n//   returns { seeds: [ { seedKey, url, metadata } ], warnings: [] }\n// Guided mode expands cities x categories x searchQueries into one seed each\n// (empty searchQueries -> one empty-query seed per city x category) rendering\n//   https://{host}.craigslist.org/search/{path}?query={query} + filters.\n// Advanced URL mode takes a single craigslist search URL -> one seed.\n\nconst v = (variables && typeof variables === \"object\") ? variables : {};\nconst meta = (template && template.metadata) ? template.metadata : {};\nconst catalog = (meta && meta.catalog) ? meta.catalog : {};\nconst cityCatalog = (catalog && catalog.cities) ? catalog.cities : {};\nconst categoryCatalog = (catalog && catalog.categories) ? catalog.categories : {};\n\nconst seeds = [];\nconst warnings = [];\n\nconst enc = (s) => encodeURIComponent(String(s));\nconst toNum = (x) => {\n    if (typeof x === \"number\" && isFinite(x)) return x;\n    if (typeof x === \"string\" && x.trim() !== \"\") {\n        const n = Number(x.trim());\n        if (isFinite(n)) return n;\n    }\n    return null;\n};\n\n// ---- Advanced URL mode (API only, mutually exclusive with guided fields) ----\nconst advRaw = typeof v.advancedSearchUrl === \"string\" ? v.advancedSearchUrl.trim() : \"\";\nif (advRaw) {\n    const am = advRaw.match(/^https:\\/\\/([a-z0-9-]+)\\.craigslist\\.org\\/search\\/([a-z0-9]+)/i);\n    let cityCode = null;\n    let categoryCode = null;\n    if (am) {\n        cityCode = am[1].toLowerCase();\n        categoryCode = am[2].toLowerCase();\n    }\n    const cc = (cityCode && cityCatalog[cityCode]) ? cityCatalog[cityCode] : {};\n    const cat = (categoryCode && categoryCatalog[categoryCode]) ? categoryCatalog[categoryCode] : {};\n    const known = !!am && !!cityCatalog[cityCode] && !!categoryCatalog[categoryCode];\n    if (!known) {\n        warnings.push({\n            code: \"catalog_entry_unknown\",\n            message: \"advanced search url host or category path is not in the template catalog\",\n            url: advRaw,\n        });\n    }\n    seeds.push({\n        seedKey: \"adv:\" + (cityCode || \"unknown\") + \":\" + (categoryCode || \"unknown\"),\n        url: advRaw,\n        metadata: {\n            mode: \"advanced\",\n            cityCode: cityCode,\n            cityLabel: cc.label || null,\n            countryCode: cc.countryCode || null,\n            defaultCurrency: cc.defaultCurrency || null,\n            categoryCode: categoryCode,\n            categoryLabel: cat.label || null,\n            categoryFamily: cat.family || null,\n            query: null,\n            pageIndex: 1,\n        },\n    });\n    return { seeds: seeds, warnings: warnings };\n}\n\n// ---- Guided mode: cities x categories x searchQueries ----\nconst cities = Array.isArray(v.cities) ? v.cities : [];\nconst categories = Array.isArray(v.categories) ? v.categories : [];\nlet queries = Array.isArray(v.searchQueries)\n    ? v.searchQueries.filter((q) => typeof q === \"string\")\n    : [];\n// Empty searchQueries -> exactly one empty-query seed per city x category.\nif (queries.length === 0) queries = [\"\"];\n\nconst minPrice = toNum(v.minPrice);\nconst maxPrice = toNum(v.maxPrice);\nconst hasPic = v.hasPic === true;\nconst sortVal = v.sort === \"date\" ? \"date\" : null; // \"default\" -> omit (craigslist default)\n\ncities.forEach((cityCode, ci) => {\n    const cc = cityCatalog[cityCode] || {};\n    const host = cc.host || String(cityCode);\n    categories.forEach((categoryCode, gi) => {\n        const cat = categoryCatalog[categoryCode] || {};\n        const path = cat.searchPath || String(categoryCode);\n        const supports = Array.isArray(cat.supportedFilters)\n            ? cat.supportedFilters\n            : [\"query\", \"minPrice\", \"maxPrice\", \"hasPic\"];\n        queries.forEach((rawQuery, qi) => {\n            const query = (rawQuery || \"\").trim();\n            const params = [];\n            if (query) params.push(\"query=\" + enc(query));\n            if (minPrice !== null && supports.indexOf(\"minPrice\") !== -1) {\n                params.push(\"min_price=\" + enc(minPrice));\n            }\n            if (maxPrice !== null && supports.indexOf(\"maxPrice\") !== -1) {\n                params.push(\"max_price=\" + enc(maxPrice));\n            }\n            if (hasPic && supports.indexOf(\"hasPic\") !== -1) params.push(\"hasPic=1\");\n            if (sortVal) params.push(\"sort=\" + sortVal);\n            const url =\n                \"https://\" + host + \".craigslist.org/search/\" + path +\n                (params.length ? \"?\" + params.join(\"&\") : \"\");\n            const seedKey =\n                ci + \":\" + gi + \":\" + qi + \"|\" +\n                String(cityCode) + \":\" + String(categoryCode) + \":\" + (query || \"*\");\n            seeds.push({\n                seedKey: seedKey,\n                url: url,\n                metadata: {\n                    mode: \"guided\",\n                    cityCode: String(cityCode),\n                    cityLabel: cc.label || null,\n                    countryCode: cc.countryCode || null,\n                    defaultCurrency: cc.defaultCurrency || null,\n                    categoryCode: String(categoryCode),\n                    categoryLabel: cat.label || null,\n                    categoryFamily: cat.family || null,\n                    query: query || null,\n                    minPrice: minPrice,\n                    maxPrice: maxPrice,\n                    hasPic: hasPic,\n                    sort: sortVal,\n                    pageIndex: 1,\n                },\n            });\n        });\n    });\n});\n\nreturn { seeds: seeds, warnings: warnings };\n"
+      }
+    },
+    "requestHandler": {
+      "enabled": true,
+      "code": {
+        "language": "javascript",
+        "source": "// craigslist-all-in-one :: requestHandler (orchestrated page handler)\n//\n// Readable / node-checkable mirror of\n//   craigslist-all-in-one.template.json -> customHandlers.requestHandler.code.source\n// The JSON embeds this exact text as an inline string; keep the two in sync\n// (verified by the template's build/verify step). The runtime executes this\n// body inside the non-trusted VM sandbox as an async function body (top-level\n// `return` allowed). Only standard ECMAScript intrinsics plus the sandbox\n// globals context / template / variables / JSON / Math / Date / RegExp are\n// available: no module loading, no DOM, no cheerio. Craigslist search-results\n// HTML is therefore parsed defensively with regex/string scanning.\n//\n// Contract (docs/design/template-runs-datasets-platform.md 7.2):\n//   returns { items: [ListingSummary], nextUrl: string|null, detailRequests: [], warnings: [] }\n// Phase 1: search listing scraper only. No detail requests.\n\n// ---------------------------------------------------------------- helpers ---\nconst stripTags = (s) => String(s == null ? \"\" : s).replace(/<[^>]*>/g, \" \");\nconst decodeEntities = (s) =>\n    String(s == null ? \"\" : s)\n        .replace(/&amp;/gi, \"&\")\n        .replace(/&lt;/gi, \"<\")\n        .replace(/&gt;/gi, \">\")\n        .replace(/&quot;/gi, '\"')\n        .replace(/&#0*39;|&#x0*27;|&apos;/gi, \"'\")\n        .replace(/&nbsp;/gi, \" \");\nconst cleanText = (s) => decodeEntities(stripTags(s)).replace(/\\s+/g, \" \").trim();\n\n// Return the first capturing-group value that matches any of the patterns.\nconst firstMatch = (str, patterns) => {\n    let out = null;\n    patterns.some((re) => {\n        const m = String(str).match(re);\n        if (m && m[1] != null && String(m[1]).trim() !== \"\") {\n            out = m[1];\n            return true;\n        }\n        return false;\n    });\n    return out;\n};\n\nconst numberify = (x, fallback) => {\n    const n = Number(x);\n    return isFinite(n) ? n : fallback;\n};\n\n// Craigslist price / currency parser (design doc section 11).\nconst parsePrice = (raw, country) => {\n    if (raw == null || String(raw).trim() === \"\") {\n        return { raw: null, amount: null, currency: null, parsed: false, isRange: false, isFree: false };\n    }\n    const t = String(raw).trim();\n    let currency = null;\n    if (/C\\$|\\bCAD\\b/i.test(t)) currency = \"CAD\";\n    else if (/US\\$|\\bUSD\\b/i.test(t)) currency = \"USD\";\n    else if (t.indexOf(\"$\") !== -1) currency = country === \"US\" ? \"USD\" : country === \"CA\" ? \"CAD\" : null;\n    const nums = t.match(/[0-9][0-9.,]*/g) || [];\n    const isFree = /\\bfree\\b/i.test(t);\n    const isRange = nums.length > 1;\n    let amount = null;\n    if (!isFree && !isRange && nums.length === 1) {\n        const n = Number(nums[0].replace(/,/g, \"\"));\n        if (isFinite(n)) amount = n;\n    }\n    return { raw: t, amount: amount, currency: currency, parsed: amount !== null, isRange: isRange, isFree: isFree };\n};\n\nconst normalizeUrl = (href, origin) => {\n    if (!href) return null;\n    let u = decodeEntities(String(href)).trim();\n    if (u.indexOf(\"//\") === 0) return \"https:\" + u;\n    if (u.charAt(0) === \"/\") return origin ? origin + u : null;\n    if (/^https?:\\/\\//i.test(u)) return u;\n    return null;\n};\n\n// ------------------------------------------------------------ inputs / ctx ---\nconst ctx = (typeof context !== \"undefined\" && context) ? context : {};\nconst data = ctx.data || {};\nconst scrape = data.scrapeResult || {};\nconst html = (typeof ctx.html === \"string\" && ctx.html) || scrape.rawHtml || scrape.html || data.rawHtml || \"\";\nconst pageUrl =\n    scrape.url || (data.request && data.request.url) || data.url || (data.metadata && data.metadata.url) || \"\";\n\nconst tmpl = ctx.template || (typeof template !== \"undefined\" ? template : {}) || {};\nconst catalog = (tmpl.metadata && tmpl.metadata.catalog) ? tmpl.metadata.catalog : {};\nconst cityCatalog = catalog.cities || {};\nconst categoryCatalog = catalog.categories || {};\n\nconst seedMeta =\n    data.seedMeta ||\n    (data.userData && (data.userData.seedMeta || data.userData.seed || data.userData.metadata)) ||\n    data.metadata ||\n    {};\n\nconst urlHost = ((pageUrl.match(/^https?:\\/\\/([a-z0-9-]+)\\.craigslist\\.org/i) || [])[1] || \"\").toLowerCase() || null;\nconst urlCat = ((pageUrl.match(/\\/search\\/([a-z0-9]+)/i) || [])[1] || \"\").toLowerCase() || null;\n\nconst cityCode = seedMeta.cityCode || urlHost || null;\nconst categoryCode = seedMeta.categoryCode || urlCat || null;\nconst cityEntry = (cityCode && cityCatalog[cityCode]) ? cityCatalog[cityCode] : {};\nconst catEntry = (categoryCode && categoryCatalog[categoryCode]) ? categoryCatalog[categoryCode] : {};\nconst countryCode = seedMeta.countryCode || cityEntry.countryCode || null;\nconst categoryLabel = seedMeta.categoryLabel || catEntry.label || null;\nconst categoryFamily = seedMeta.categoryFamily || catEntry.family || null;\nconst seedKey = seedMeta.seedKey || null;\nconst pageIndex = numberify(\n    seedMeta.pageIndex || data.pageIndex || (data.userData && data.userData.pageIndex) || 1,\n    1\n);\nconst scrapedAt = new Date().toISOString();\nconst origin =\n    (pageUrl.match(/^(https?:\\/\\/[^/]+)/) || [])[1] ||\n    (urlHost ? \"https://\" + urlHost + \".craigslist.org\" : \"\");\n\n// ------------------------------------------------------- listing extraction ---\nconst items = [];\nconst warnings = [];\nconst H = String(html);\n\n// One candidate per detail link (.../<digits>.html). Dedup by id, keep first.\nconst linkRe = /href=\"((?:https?:)?\\/\\/[a-z0-9.-]+\\.craigslist\\.org\\/[^\"?#]*?\\/(\\d{6,})\\.html)\"/gi;\nconst seen = {};\nconst cards = [];\n[...H.matchAll(linkRe)].forEach((m) => {\n    const id = m[2];\n    if (seen[id]) return;\n    seen[id] = true;\n    let url = m[1];\n    if (url.indexOf(\"//\") === 0) url = \"https:\" + url;\n    cards.push({ id: id, url: url, index: m.index });\n});\n\nconst titlePatterns = [\n    /class=\"[^\"]*posting-title[^\"]*\"[^>]*>\\s*([\\s\\S]*?)<\\/a>/i,\n    /class=\"[^\"]*result-title[^\"]*\"[^>]*>\\s*([\\s\\S]*?)<\\/a>/i,\n    /class=\"[^\"]*hdrlnk[^\"]*\"[^>]*>\\s*([\\s\\S]*?)<\\/a>/i,\n    /class=\"[^\"]*title[^\"]*\"[^>]*>\\s*([\\s\\S]*?)<\\/(?:div|a|span|h[1-6])>/i,\n    /<li[^>]+title=\"([^\"]+)\"/i,\n    />\\s*([^<]{2,140})\\s*<\\/a>/i,\n];\nconst pricePatterns = [\n    /class=\"[^\"]*priceinfo[^\"]*\"[^>]*>\\s*([^<]*)</i,\n    /class=\"[^\"]*result-price[^\"]*\"[^>]*>\\s*([^<]*)</i,\n    /class=\"[^\"]*price[^\"]*\"[^>]*>\\s*([^<]*)</i,\n];\nconst locPatterns = [\n    /class=\"[^\"]*result-hood[^\"]*\"[^>]*>\\s*([^<]*)</i,\n    /class=\"[^\"]*location[^\"]*\"[^>]*>\\s*([^<]*)</i,\n    /class=\"[^\"]*supertitle[^\"]*\"[^>]*>\\s*([^<]*)</i,\n];\nconst datePatterns = [/datetime=\"([^\"]+)\"/i];\nconst imgSrcPatterns = [/<img[^>]+src=\"([^\"]+)\"/i, /data-ids=\"[0-9]+:([0-9a-z]+)/i];\nconst hasImageRe = /data-ids=\"[^\"]+\"|<img\\b|result-image|gallery-card|swipe/i;\n\ncards.forEach((card, i) => {\n    // Scope each listing to its enclosing <li>...</li> so fields do not bleed\n    // between cards and the next card's opening tag is excluded.\n    let start = H.lastIndexOf(\"<li \", card.index);\n    if (start < 0) start = card.index > 300 ? card.index - 300 : 0;\n    let end = H.indexOf(\"</li>\", card.index);\n    if (end < 0) end = i + 1 < cards.length ? cards[i + 1].index : H.length;\n    else end += 5;\n    const slice = H.substring(start, end);\n    const position = i + 1;\n\n    const title = cleanText(firstMatch(slice, titlePatterns)) || null;\n\n    // Required contract: id + url + title. Skip half-baked rows (doc section 9).\n    if (!card.id || !card.url || !title) {\n        warnings.push({\n            code: \"invalid_listing\",\n            pageIndex: pageIndex,\n            position: position,\n            id: card.id || null,\n            url: card.url || null,\n            reason: \"missing required listing field id url or title\",\n        });\n        return;\n    }\n\n    const rawPrice = cleanText(firstMatch(slice, pricePatterns)) || null;\n    const price = parsePrice(rawPrice, countryCode);\n\n    const rawLoc = firstMatch(slice, locPatterns);\n    const location = rawLoc\n        ? decodeEntities(stripTags(rawLoc)).replace(/[()]/g, \"\").replace(/\\s+/g, \" \").trim() || null\n        : null;\n\n    const postedAt = firstMatch(slice, datePatterns) || null;\n\n    const hasImage = hasImageRe.test(slice);\n    let thumbnailUrl = null;\n    if (hasImage) {\n        const imgHit = firstMatch(slice, imgSrcPatterns);\n        if (imgHit && /^https?:|^\\/\\//i.test(imgHit)) thumbnailUrl = normalizeUrl(imgHit, origin);\n        else if (imgHit) thumbnailUrl = \"https://images.craigslist.org/\" + imgHit + \"_300x300.jpg\";\n    }\n\n    // Deterministic completeness (doc section 12).\n    const applicable = [card.id, card.url, title, categoryCode, price.raw, location, postedAt];\n    let present = 0;\n    let total = 0;\n    applicable.forEach((f) => {\n        total += 1;\n        if (f !== null && f !== undefined && f !== \"\") present += 1;\n    });\n    total += 1; // hasImage is always a valid boolean (false counts as present)\n    present += 1;\n    if (hasImage === true) {\n        total += 1;\n        if (thumbnailUrl) present += 1;\n    }\n    const completeness = Math.round((present / total) * 100);\n\n    const missingFields = [];\n    if (categoryCode == null) missingFields.push(\"category.code\");\n    if (price.raw == null) missingFields.push(\"price.raw\");\n    if (location == null) missingFields.push(\"location.raw\");\n    if (postedAt == null) missingFields.push(\"postedAt\");\n    if (hasImage === true && thumbnailUrl == null) missingFields.push(\"thumbnailUrl\");\n\n    const itemWarnings = [];\n    if (price.raw == null) itemWarnings.push(\"price_missing\");\n    else if (!price.parsed && !price.isRange && !price.isFree) itemWarnings.push(\"price_parse_uncertain\");\n    if (location == null) itemWarnings.push(\"location_missing\");\n    if (postedAt == null) itemWarnings.push(\"posted_time_missing\");\n    if (hasImage === true && thumbnailUrl == null) itemWarnings.push(\"thumbnail_missing\");\n\n    items.push({\n        id: card.id,\n        itemKey: \"craigslist:\" + card.id,\n        source: \"craigslist\",\n        url: card.url,\n        title: title,\n        price: { raw: price.raw, amount: price.amount, currency: price.currency },\n        location: { raw: location, cityCode: cityCode, countryCode: countryCode },\n        category: { code: categoryCode, label: categoryLabel, family: categoryFamily },\n        postedAt: postedAt,\n        thumbnailUrl: thumbnailUrl,\n        hasImage: hasImage,\n        pageIndex: pageIndex,\n        position: position,\n        quality: {\n            completeness: completeness,\n            status: completeness === 100 ? \"complete\" : \"partial\",\n            missingFields: missingFields,\n            warnings: itemWarnings,\n        },\n        provenance: { seedKey: seedKey, scrapedAt: scrapedAt },\n    });\n});\n\n// ----------------------------------------------------------------- nextUrl ---\nconst nextPatterns = [\n    /<link[^>]+rel=\"next\"[^>]+href=\"([^\"]+)\"/i,\n    /rel=\"next\"[^>]*href=\"([^\"]+)\"/i,\n    /href=\"([^\"]+)\"[^>]*rel=\"next\"/i,\n    /class=\"[^\"]*button[^\"]*next[^\"]*\"[^>]*href=\"([^\"]+)\"/i,\n    /href=\"([^\"]+)\"[^>]*class=\"[^\"]*button[^\"]*next[^\"]*\"/i,\n];\nlet nextUrl = normalizeUrl(firstMatch(html, nextPatterns), origin);\nif (nextUrl && pageUrl && nextUrl === pageUrl) nextUrl = null; // loop guard\n\nreturn { items: items, nextUrl: nextUrl, detailRequests: [], warnings: warnings };\n"
+      }
+    }
+  },
+  "metadata": {
+    "allowedDomains": {
+      "type": "glob",
+      "patterns": [
+        "*.craigslist.org"
+      ]
+    },
+    "debug": false,
+    "catalog": {
+      "cities": {
+        "sfbay": {
+          "label": "SF Bay Area",
+          "host": "sfbay",
+          "countryCode": "US",
+          "timezone": "America/Los_Angeles",
+          "defaultCurrency": "USD"
+        },
+        "newyork": {
+          "label": "New York City",
+          "host": "newyork",
+          "countryCode": "US",
+          "timezone": "America/New_York",
+          "defaultCurrency": "USD"
+        },
+        "losangeles": {
+          "label": "Los Angeles",
+          "host": "losangeles",
+          "countryCode": "US",
+          "timezone": "America/Los_Angeles",
+          "defaultCurrency": "USD"
+        },
+        "chicago": {
+          "label": "Chicago",
+          "host": "chicago",
+          "countryCode": "US",
+          "timezone": "America/Chicago",
+          "defaultCurrency": "USD"
+        },
+        "seattle": {
+          "label": "Seattle",
+          "host": "seattle",
+          "countryCode": "US",
+          "timezone": "America/Los_Angeles",
+          "defaultCurrency": "USD"
+        },
+        "boston": {
+          "label": "Boston",
+          "host": "boston",
+          "countryCode": "US",
+          "timezone": "America/New_York",
+          "defaultCurrency": "USD"
+        },
+        "toronto": {
+          "label": "Toronto",
+          "host": "toronto",
+          "countryCode": "CA",
+          "timezone": "America/Toronto",
+          "defaultCurrency": "CAD"
+        },
+        "vancouver": {
+          "label": "Vancouver",
+          "host": "vancouver",
+          "countryCode": "CA",
+          "timezone": "America/Vancouver",
+          "defaultCurrency": "CAD"
+        }
+      },
+      "categories": {
+        "sss": {
+          "label": "for sale",
+          "family": "for-sale",
+          "searchPath": "sss",
+          "supportedFilters": [
+            "query",
+            "minPrice",
+            "maxPrice",
+            "hasPic"
+          ]
+        },
+        "cta": {
+          "label": "cars & trucks",
+          "family": "for-sale",
+          "searchPath": "cta",
+          "supportedFilters": [
+            "query",
+            "minPrice",
+            "maxPrice",
+            "hasPic"
+          ]
+        },
+        "ela": {
+          "label": "electronics",
+          "family": "for-sale",
+          "searchPath": "ela",
+          "supportedFilters": [
+            "query",
+            "minPrice",
+            "maxPrice",
+            "hasPic"
+          ]
+        },
+        "apa": {
+          "label": "apartments / housing for rent",
+          "family": "housing",
+          "searchPath": "apa",
+          "supportedFilters": [
+            "query",
+            "minPrice",
+            "maxPrice",
+            "hasPic"
+          ]
+        },
+        "jjj": {
+          "label": "jobs",
+          "family": "jobs",
+          "searchPath": "jjj",
+          "supportedFilters": [
+            "query"
+          ]
+        },
+        "ggg": {
+          "label": "gigs",
+          "family": "gigs",
+          "searchPath": "ggg",
+          "supportedFilters": [
+            "query",
+            "hasPic"
+          ]
+        }
+      }
+    }
+  },
+  "variables": {
+    "cities": {
+      "type": "array",
+      "label": "Cities",
+      "description": "Craigslist city sites to search.",
+      "required": true,
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "enum",
+        "values": [
+          "sfbay",
+          "newyork",
+          "losangeles",
+          "chicago",
+          "seattle",
+          "boston",
+          "toronto",
+          "vancouver"
+        ]
+      },
+      "defaultValue": [
+        "sfbay"
+      ]
+    },
+    "categories": {
+      "type": "array",
+      "label": "Categories",
+      "description": "Craigslist search categories.",
+      "required": true,
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "enum",
+        "values": [
+          "sss",
+          "cta",
+          "ela",
+          "apa",
+          "jjj",
+          "ggg"
+        ]
+      },
+      "defaultValue": [
+        "sss"
+      ]
+    },
+    "searchQueries": {
+      "type": "array",
+      "label": "Search queries",
+      "description": "Optional keywords. Empty produces one browse seed per city x category.",
+      "required": false,
+      "maxItems": 20,
+      "items": {
+        "type": "string"
+      },
+      "defaultValue": []
+    },
+    "minPrice": {
+      "type": "number",
+      "label": "Min price",
+      "description": "Minimum price filter.",
+      "required": false,
+      "min": 0,
+      "max": 100000
+    },
+    "maxPrice": {
+      "type": "number",
+      "label": "Max price",
+      "description": "Maximum price filter.",
+      "required": false,
+      "min": 0,
+      "max": 100000
+    },
+    "hasPic": {
+      "type": "boolean",
+      "label": "Has image",
+      "description": "Only listings that declare an image.",
+      "required": false,
+      "defaultValue": false
+    },
+    "sort": {
+      "type": "enum",
+      "label": "Sort",
+      "description": "Result ordering.",
+      "required": false,
+      "values": [
+        "date",
+        "default"
+      ],
+      "defaultValue": "default"
+    },
+    "advancedSearchUrl": {
+      "type": "url",
+      "label": "Advanced search URL",
+      "description": "API-only. A single https://*.craigslist.org/search/... URL. Mutually exclusive with the guided fields.",
+      "required": false
+    }
+  },
+  "createdBy": "system-admin",
+  "publishedBy": "system-admin",
+  "reviewedBy": "system-admin",
+  "status": "published",
+  "reviewStatus": "approved",
+  "reviewNotes": "Craigslist all-in-one orchestrated template (Phase 1: search listing scraper).",
+  "trusted": false,
+  "createdAt": "2026-08-06T00:00:00.000Z",
+  "updatedAt": "2026-08-06T00:00:00.000Z",
+  "publishedAt": "2026-08-06T00:00:00.000Z",
+  "reviewedAt": "2026-08-06T00:00:00.000Z"
+}
