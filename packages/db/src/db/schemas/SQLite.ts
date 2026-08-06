@@ -736,3 +736,40 @@ export const templateRunEvents = p.sqliteTable("template_run_events", {
 }, (t) => [
     p.index("ix_template_run_event_cursor").on(t.templateRunUuid, t.createdAt, t.uuid),
 ]);
+
+// ============================================================================
+// Template Run Requests (L3 Phase 4) — SQLite parallel of platform §9.3.
+// Type substitutions: uuid->text, timestamptz->integer{timestamp}. Same
+// table/column/index names and semantics as PostgreSQL: `UNIQUE(template_run_id,
+// request_key)` makes enqueue idempotent so a BullMQ retry never re-dispatches
+// the same logical request; the page/detail visited check reads this ledger.
+//
+// `parent_request_id` is a PLAIN column, NOT a self-referencing FK — a child
+// request can be enqueued before its parent and resume may re-materialize rows
+// out of order; a self-FK would impose an insert-ordering constraint. The parent
+// link's integrity is enforced in the model/worker layer, not by the schema.
+// ============================================================================
+
+export const templateRunRequests = p.sqliteTable("template_run_requests", {
+    uuid: p.text("uuid").primaryKey().$defaultFn(() => randomUUID()),
+    templateRunUuid: p.text("template_run_id").notNull().references(() => templateRuns.uuid, { onDelete: "cascade" }),
+    requestKey: p.text("request_key").notNull(),                       // derived: request type + seed + normalized URL
+    requestType: p.text("request_type").notNull(),                    // page | detail | seed
+    seedKey: p.text("seed_key"),
+    seedIndex: p.integer("seed_index"),
+    parentRequestUuid: p.text("parent_request_id"),                   // plain column, NO self-FK (see note above)
+    normalizedUrl: p.text("normalized_url").notNull(),
+    pageIndex: p.integer("page_index"),
+    status: p.text("status").notNull(),                               // queued | running | completed | failed | skipped
+    attempts: p.integer("attempts").notNull().default(0),
+    queueJobId: p.text("queue_job_id"),
+    lastError: p.text("last_error"),
+    queuedAt: p.integer("queued_at", { mode: "timestamp" }),
+    startedAt: p.integer("started_at", { mode: "timestamp" }),
+    finishedAt: p.integer("finished_at", { mode: "timestamp" }),
+    createdAt: p.integer("created_at", { mode: "timestamp" }).notNull(),
+}, (t) => [
+    p.uniqueIndex("uq_template_run_request").on(t.templateRunUuid, t.requestKey),
+    p.index("ix_template_run_request_status").on(t.templateRunUuid, t.status),
+    p.index("ix_template_run_request_seq").on(t.templateRunUuid, t.seedIndex, t.pageIndex),
+]);

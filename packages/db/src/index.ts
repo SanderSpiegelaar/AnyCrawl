@@ -32,6 +32,7 @@ import { Dataset } from "./model/Dataset.js";
 import { DatasetWriter } from "./model/DatasetWriter.js";
 import { TemplateRevision } from "./model/TemplateRevision.js";
 import { TemplateRun } from "./model/TemplateRun.js";
+import { TemplateRunRequest } from "./model/TemplateRunRequest.js";
 import {
     buildTemplateRunWhereClause as buildTemplateRunWhereClauseByOwner,
     getOwnedTemplateRun as getOwnedTemplateRunByOwner,
@@ -82,6 +83,15 @@ export const requestTemplateRunCancel = TemplateRun.requestCancel;
 export const finalizeTemplateRun = TemplateRun.finalize;
 export const appendTemplateRunEvent = TemplateRun.appendEvent;
 export const listTemplateRunEvents = TemplateRun.listEvents;
+
+// Template run requests (L3 Phase 4) — orchestrated request ledger: idempotent
+// enqueue, get, list-by-run, status patch, atomic claim, and status counts.
+export const enqueueTemplateRunRequest = TemplateRunRequest.enqueue;
+export const getTemplateRunRequest = TemplateRunRequest.get;
+export const listTemplateRunRequestsByRun = TemplateRunRequest.listByRun;
+export const updateTemplateRunRequestStatus = TemplateRunRequest.updateStatus;
+export const claimNextTemplateRunRequest = TemplateRunRequest.claimNext;
+export const countTemplateRunRequestsByStatus = TemplateRunRequest.countByStatus;
 
 // Template run ownership + access helpers
 export const buildTemplateRunWhereClause = buildTemplateRunWhereClauseByOwner;
@@ -160,6 +170,9 @@ export { templates, templateExecutions, templateRevisions, billingLedger } from 
 // Template run (L3 Phase 3) table exports
 export { templateRuns, templateRunEvents } from "./db/schemas/PostgreSQL.js";
 
+// Template run request (L3 Phase 4) table export
+export { templateRunRequests } from "./db/schemas/PostgreSQL.js";
+
 // Scheduled tasks and webhooks exports
 export {
     scheduledTasks,
@@ -189,7 +202,7 @@ export {
     runWarnings,
 } from "./db/schemas/PostgreSQL.js";
 
-export { eq, and, gt, gte, sql, desc, getDB, schemas, STATUS, JOB_RESULT_STATUS, Job, Billing, Dataset, TemplateRevision, TemplateRun };
+export { eq, and, gt, gte, sql, desc, getDB, schemas, STATUS, JOB_RESULT_STATUS, Job, Billing, Dataset, TemplateRevision, TemplateRun, TemplateRunRequest };
 export { TEMPLATE_RUN_TERMINAL_STATUSES } from "./model/TemplateRun.js";
 export type { CreateJobParams, CreateTemplateParams };
 export type { FreezeRevisionParams } from "./model/TemplateRevision.js";
@@ -201,6 +214,13 @@ export type {
     TemplateRunStatus,
     TemplateRunTerminalStatus,
 } from "./model/TemplateRun.js";
+export type {
+    EnqueueTemplateRunRequestParams,
+    UpdateTemplateRunRequestPatch,
+    ClaimNextOptions,
+    TemplateRunRequestType,
+    TemplateRunRequestStatus,
+} from "./model/TemplateRunRequest.js";
 export type {
     FieldType as DatasetFieldType,
     FilterOp as DatasetFilterOp,

@@ -771,3 +771,48 @@ export const templateRunEvents = p.pgTable("template_run_events", {
 }, (t) => [
     p.index("ix_template_run_event_cursor").on(t.templateRunUuid, t.createdAt, t.uuid),
 ]);
+
+// ============================================================================
+// Template Run Requests (L3 Phase 4) — orchestrated request ledger (platform
+// §9.3). One row per logical request an orchestrated Run dispatches (seed / page
+// / detail). The DB holds business state (visited/loop-detection + resume);
+// BullMQ holds dispatch state; the two align through the stable `queue_job_id`.
+// `UNIQUE(template_run_id, request_key)` makes enqueue idempotent so a BullMQ
+// retry never re-dispatches the same logical request. `request_key` is derived
+// from request type + seed + normalized URL, and the page/detail visited check
+// reads this ledger.
+//
+// `parent_request_id` is a PLAIN column, NOT a self-referencing FK: a child
+// request (e.g. a detail spawned by a page) can be enqueued before/independently
+// of a strict parent-insert ordering, and orchestrated resume may re-materialize
+// rows out of order — a self-FK would impose an insert-ordering constraint and
+// risk violations on replay. Referential integrity of the parent link is
+// enforced in the model/worker layer, not by the schema.
+// ============================================================================
+
+export const templateRunRequests = p.pgTable("template_run_requests", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    templateRunUuid: p.uuid("template_run_id").notNull().references(() => templateRuns.uuid, { onDelete: "cascade" }),
+    requestKey: p.text("request_key").notNull(),                        // derived: request type + seed + normalized URL
+    requestType: p.text("request_type").notNull(),                     // page | detail | seed
+    seedKey: p.text("seed_key"),
+    seedIndex: p.integer("seed_index"),
+    parentRequestUuid: p.uuid("parent_request_id"),                    // plain column, NO self-FK (see note above)
+    normalizedUrl: p.text("normalized_url").notNull(),
+    pageIndex: p.integer("page_index"),
+    status: p.text("status").notNull(),                                // queued | running | completed | failed | skipped
+    attempts: p.integer("attempts").notNull().default(0),
+    queueJobId: p.text("queue_job_id"),
+    lastError: p.text("last_error"),
+    queuedAt: p.timestamp("queued_at", { withTimezone: true }),
+    startedAt: p.timestamp("started_at", { withTimezone: true }),
+    finishedAt: p.timestamp("finished_at", { withTimezone: true }),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+}, (t) => [
+    // Idempotent dispatch guard (§9.3): one row per logical request within a run.
+    p.uniqueIndex("uq_template_run_request").on(t.templateRunUuid, t.requestKey),
+    // Status scans within a run (claimNext / countByStatus).
+    p.index("ix_template_run_request_status").on(t.templateRunUuid, t.status),
+    // Deterministic ordering / visited walk within a run.
+    p.index("ix_template_run_request_seq").on(t.templateRunUuid, t.seedIndex, t.pageIndex),
+]);
