@@ -162,6 +162,13 @@
       "when": 1786005155720,
       "tag": "0022_template_run_requests",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1786011915664,
+      "tag": "0023_template_runtime_output_schema",
+      "breakpoints": true
     }
   ]
 }

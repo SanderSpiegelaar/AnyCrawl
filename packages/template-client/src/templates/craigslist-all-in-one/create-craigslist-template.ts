@@ -14,10 +14,12 @@ import type { TemplateConfig } from "@anycrawl/libs";
  * `src/libs/create-template.ts`, which is how templates are registered in this
  * repo.
  *
- * Note: `runtime` and `outputSchema` are L3 config/revision-snapshot fields and
- * have no dedicated `templates` columns yet, so (like the existing seed script)
- * they are not part of the column insert; `customHandlers` is stored verbatim as
- * jsonb, so the `seedHandler` key is preserved.
+ * `runtime` and `outputSchema` are the top-level L3 config fields the JSON
+ * authors; they now persist to dedicated nullable `templates.runtime` /
+ * `templates.output_schema` columns so an orchestrated template resolves with
+ * `runtime.mode` set and the frozen revision snapshot carries them.
+ * `customHandlers` is stored verbatim as jsonb, so the `seedHandler` key is
+ * preserved.
  */
 const require = createRequire(import.meta.url);
 const config = require("./craigslist-all-in-one.template.json") as Record<string, any>;
@@ -43,6 +45,8 @@ export async function createCraigslistTemplate(): Promise<TemplateConfig> {
         customHandlers: config.customHandlers, // includes seedHandler + requestHandler
         metadata: config.metadata,
         variables: config.variables,
+        runtime: config.runtime,
+        outputSchema: config.outputSchema,
         createdBy: config.createdBy,
         publishedBy: config.publishedBy,
         reviewedBy: config.reviewedBy,

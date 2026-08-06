@@ -201,6 +201,12 @@ export const templates = p.sqliteTable("templates", {
     metadata: p.text("metadata", { mode: "json" }).notNull(),
     // Template variables (JSON): { [key: string]: { type: string, description: string, required: boolean, defaultValue?: any } }
     variables: p.text("variables", { mode: "json" }),
+    // Orchestrated runtime config (JSON): { mode, seedBuilder, defaultRunOptions, ... }.
+    // Nullable; required for orchestrated templates so `.runtime?.mode` resolves and the
+    // frozen revision snapshot carries what OrchestratedRunner needs to dispatch.
+    runtime: p.text("runtime", { mode: "json" }),
+    // Output schema for dataset projection (JSON): { name, version, itemsPath, ... }. Nullable.
+    outputSchema: p.text("output_schema", { mode: "json" }),
     // User information
     createdBy: p.text("created_by").notNull(),
     publishedBy: p.text("published_by"),

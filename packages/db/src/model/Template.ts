@@ -23,6 +23,8 @@ export interface CreateTemplateParams {
     customHandlers?: any;
     metadata?: any;
     variables?: any;
+    runtime?: any;
+    outputSchema?: any;
     createdBy: string;
     publishedBy?: string;
     reviewedBy?: string;
@@ -61,6 +63,8 @@ export class Template {
             customHandlers: params.customHandlers || null,
             metadata: params.metadata || {},
             variables: params.variables || null,
+            runtime: params.runtime ?? null,
+            outputSchema: params.outputSchema ?? null,
             createdBy: params.createdBy,
             publishedBy: params.publishedBy || null,
             reviewedBy: params.reviewedBy || null,
@@ -193,6 +197,8 @@ export class Template {
             updateData.customHandlers = updates.customHandlers || null;
         if (updates.metadata !== undefined) updateData.metadata = updates.metadata;
         if (updates.variables !== undefined) updateData.variables = updates.variables || null;
+        if (updates.runtime !== undefined) updateData.runtime = updates.runtime ?? null;
+        if (updates.outputSchema !== undefined) updateData.outputSchema = updates.outputSchema ?? null;
         if (updates.status !== undefined) updateData.status = updates.status;
         if (updates.reviewStatus !== undefined) updateData.reviewStatus = updates.reviewStatus;
         if (updates.reviewNotes !== undefined) updateData.reviewNotes = updates.reviewNotes;
@@ -318,6 +324,8 @@ export class Template {
             customHandlers: row.customHandlers || undefined,
             metadata: row.metadata || {},
             variables: row.variables || undefined,
+            runtime: row.runtime ?? undefined,
+            outputSchema: row.outputSchema ?? undefined,
             createdBy: row.createdBy,
             publishedBy: row.publishedBy,
             reviewedBy: row.reviewedBy,
