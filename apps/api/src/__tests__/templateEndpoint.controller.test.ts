@@ -188,4 +188,67 @@ describe("TemplateEndpointController.spec", () => {
         expect(res.body.data.slug).toBeNull();
         expect(res.body.data.endpoint.path).toBe("/v1/template/content-extractor/execute");
     });
+
+    it("marks url + variables as required and url_mode 'user' for a default scrape template with a required variable", async () => {
+        resolveTemplateByRef.mockResolvedValue({
+            ...scrapeTemplate,
+            variables: { foo: { type: "string", required: true, description: "d" } },
+        });
+        const controller = new TemplateEndpointController();
+        const req = mockReq("content-extractor");
+        const res = mockRes();
+
+        await controller.spec(req, res);
+
+        expect(res.body.data.inputs.required).toEqual(["url", "variables"]);
+        expect(res.body.data.inputs.optional).toEqual([]);
+        expect(res.body.data.inputs.url_mode).toBe("user");
+        expect(res.body.data.output.return_modes).toEqual(["result", "items"]);
+        expect(res.body.data.output.dataset_supported).toBe(true);
+    });
+
+    it("uses 'query' as the primary key for search templates", async () => {
+        resolveTemplateByRef.mockResolvedValue({ ...scrapeTemplate, templateType: "search" });
+        const controller = new TemplateEndpointController();
+        const req = mockReq("news-search");
+        const res = mockRes();
+
+        await controller.spec(req, res);
+
+        expect(res.body.data.inputs.required).toContain("query");
+        expect(res.body.data.inputs.required).not.toContain("url");
+        expect(res.body.data.inputs.optional).not.toContain("url");
+    });
+
+    it("derives url_mode 'generated' (primary key omitted) for an orchestrated template with a seedBuilder", async () => {
+        resolveTemplateByRef.mockResolvedValue({
+            ...scrapeTemplate,
+            runtime: { mode: "orchestrated", seedBuilder: { type: "handler", name: "seed" } },
+        });
+        const controller = new TemplateEndpointController();
+        const req = mockReq("content-extractor");
+        const res = mockRes();
+
+        await controller.spec(req, res);
+
+        expect(res.body.data.inputs.url_mode).toBe("generated");
+        expect(res.body.data.inputs.required).not.toContain("url");
+        expect(res.body.data.inputs.optional).not.toContain("url");
+    });
+
+    it("honors an explicit metadata.urlMode override, placing the primary key in optional for 'hybrid'", async () => {
+        resolveTemplateByRef.mockResolvedValue({
+            ...scrapeTemplate,
+            metadata: { ...scrapeTemplate.metadata, urlMode: "hybrid" },
+        });
+        const controller = new TemplateEndpointController();
+        const req = mockReq("content-extractor");
+        const res = mockRes();
+
+        await controller.spec(req, res);
+
+        expect(res.body.data.inputs.url_mode).toBe("hybrid");
+        expect(res.body.data.inputs.optional).toContain("url");
+        expect(res.body.data.inputs.required).not.toContain("url");
+    });
 });

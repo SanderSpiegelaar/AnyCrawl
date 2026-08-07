@@ -160,6 +160,19 @@ export interface TemplateConfig {
          * When omitted or `true`, scrape template pricing applies as usual.
          */
         charge_scrape_template_credits?: boolean;
+        /**
+         * Explicit override for the call-spec `inputs.url_mode` (design doc §5.6). When set to one
+         * of the four valid values, it wins over the derived default in
+         * `TemplateEndpointController.spec()`. Absent for every template today; only needed by
+         * future templates that don't fit the "caller must supply url/query" default (e.g. a
+         * fixed-URL template, or one where the caller may optionally override a generated seed URL).
+         *   - "user": caller must supply `url`/`query` (today's universal default).
+         *   - "fixed": template always scrapes a fixed URL; caller supplies nothing.
+         *   - "generated": template assembles its own seed URL(s) (e.g. orchestrated seedHandler);
+         *     caller supplies nothing.
+         *   - "hybrid": template has a default/generated URL but the caller may optionally override it.
+         */
+        urlMode?: "user" | "fixed" | "generated" | "hybrid";
         [key: string]: any;
     };
 

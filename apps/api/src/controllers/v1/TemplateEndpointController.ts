@@ -136,6 +136,39 @@ export class TemplateEndpointController {
         const pathRef = template.slug || template.templateId;
         const metadata = (template.metadata as any) || {};
 
+        // --- inputs.url_mode (design doc §5.6) ---------------------------------
+        // Precedence: explicit template declaration > orchestrated-with-seedBuilder
+        // inference > today's universal default ("user" supplies url/query).
+        const VALID_URL_MODES = ["user", "fixed", "generated", "hybrid"] as const;
+        type UrlMode = (typeof VALID_URL_MODES)[number];
+        let urlMode: UrlMode;
+        if (VALID_URL_MODES.includes(metadata.urlMode)) {
+            urlMode = metadata.urlMode;
+        } else if (template.runtime?.mode === "orchestrated" && template.runtime?.seedBuilder) {
+            urlMode = "generated";
+        } else {
+            urlMode = "user";
+        }
+
+        const primaryKey = template.templateType === "search" ? "query" : "url";
+        const required: string[] = [];
+        const optional: string[] = [];
+        if (urlMode === "user") {
+            required.push(primaryKey);
+        } else if (urlMode === "hybrid") {
+            optional.push(primaryKey);
+        }
+        // "fixed" / "generated": primaryKey appears in neither list.
+
+        const variableEntries = Object.values(template.variables ?? {});
+        if (variableEntries.length > 0) {
+            if (variableEntries.some((v: any) => v?.required === true)) {
+                required.push("variables");
+            } else {
+                optional.push("variables");
+            }
+        }
+
         res.status(200).json({
             success: true,
             data: {
@@ -149,6 +182,7 @@ export class TemplateEndpointController {
                     method: "POST",
                     path: `/v1/template/${pathRef}/execute`,
                 },
+                inputs: { required, optional, url_mode: urlMode },
                 variables: template.variables ?? {},
                 pricing: template.pricing,
                 allowed_domains: metadata.allowedDomains ?? null,
@@ -157,6 +191,7 @@ export class TemplateEndpointController {
                 runtime: { mode: template.runtime?.mode ?? "single" },
                 output: {
                     dataset_supported: true,
+                    return_modes: ["result", "items"],
                     schema: template.outputSchema
                         ? { name: template.outputSchema.name, version: template.outputSchema.version }
                         : null,
