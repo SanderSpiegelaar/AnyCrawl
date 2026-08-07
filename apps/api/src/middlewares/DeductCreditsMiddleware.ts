@@ -39,7 +39,15 @@ export const deductCreditsMiddleware = async (
             // at its definition — a config error. Flag it loudly (CI/monitoring), but still deduct:
             // skipping the charge would grant free execution, which is worse than a late charge.
             if (req.checkCredits !== true) {
-                log.error(`[BILLING-INVARIANT] chargeable request without credit gate: ${req.method} ${req.path} (job=${req.jobId}). Attach checkCreditsMiddleware to this route.`);
+                const message = `[BILLING-INVARIANT] chargeable request without credit gate: ${req.method} ${req.path} (job=${req.jobId}). Attach checkCreditsMiddleware to this route.`;
+                log.error(message);
+                // Fail loudly in CI/non-production so a route missing checkCreditsMiddleware is
+                // caught before it ships. Production does not depend on this invariant (the
+                // gate is already bound to the job-creation boundary), so it must stay log-only
+                // there to avoid turning a would-be logging anomaly into a hard outage.
+                if (process.env.NODE_ENV !== "production") {
+                    throw new Error(message);
+                }
             }
 
             const jobId = req.jobId;
