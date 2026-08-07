@@ -8,6 +8,7 @@ import {
     estimateTaskCredits,
     WebhookEventType,
     appConfig,
+    type OwnerContext,
 } from "@anycrawl/libs";
 import { CrawlerErrorType, runBatchScrape } from "@anycrawl/scrape";
 import {
@@ -17,6 +18,12 @@ import {
     getJobResultsPaginated,
     getJobResultsCount,
     cancelJob,
+    getDB,
+    createDataset,
+    assertDatasetWritable,
+    parseDatasetOutput,
+    standardDatasetMapping,
+    DatasetWriteError,
     STATUS,
 } from "@anycrawl/db";
 import { log } from "@anycrawl/libs";
@@ -41,9 +48,18 @@ export class BatchScrapeController {
         let jobId: string | null = null;
         try {
             const rawBody: Record<string, any> = req.body || {};
+
+            // Dataset output is an additive, non-schema field: capture it before the
+            // template-only whitelist check and the strict batch schema parse, then
+            // strip it so neither rejects it. Every child scrape job carries this
+            // binding and writes its page via the shared Dataset Writer (like crawl).
+            const rawDatasetOutput = rawBody.output;
+            if (rawBody && typeof rawBody === "object") delete rawBody.output;
+
             const isTemplate = typeof rawBody.template_id === "string" && rawBody.template_id.trim().length > 0;
 
-            // When using a template, only template_id/urls/variables/ignore_invalid_urls are allowed.
+            // When using a template, only template_id/urls/variables/ignore_invalid_urls are
+            // allowed (output was already captured + stripped above, so it passes this check).
             if (isTemplate && !validateTemplateOnlyFields(rawBody, res, "batch")) {
                 return;
             }
@@ -173,6 +189,53 @@ export class BatchScrapeController {
 
             const primaryUrl = coordinatorPayload.urls[0]!;
 
+            // Resolve/validate the dataset output up front (async producer): create or
+            // bind the dataset now so we can return its id and propagate it to every
+            // child scrape job, which writes its page via the shared Dataset Writer.
+            // Batch uses the scrape schema (anycrawl_scrape) — batch and scrape results
+            // are interchangeable into the same dataset.
+            const datasetOutput = parseDatasetOutput(rawDatasetOutput, { defaultName: `Batch scrape ${primaryUrl}` });
+            const datasetMapping = standardDatasetMapping("batch");
+            const datasetOwner: OwnerContext = { apiKeyId: req.auth?.uuid, userId: req.auth?.user };
+            let boundDatasetId: string | null = null;
+            if (datasetOutput) {
+                try {
+                    await assertDatasetWritable({ owner: datasetOwner, dataset: datasetOutput.dataset, mapping: datasetMapping });
+                    if ("datasetId" in datasetOutput.dataset) {
+                        boundDatasetId = datasetOutput.dataset.datasetId;
+                    } else {
+                        const db = await getDB();
+                        const created = await createDataset(db, {
+                            apiKeyId: datasetOwner.apiKeyId ?? null,
+                            userId: datasetOwner.userId ?? null,
+                            name: datasetOutput.dataset.create.name,
+                            description: datasetOutput.dataset.create.description ?? null,
+                            sourceType: "batch",
+                            schemaName: datasetMapping.name,
+                            schemaVersion: datasetMapping.version,
+                            retentionPolicy: datasetOutput.dataset.create.retentionPolicy ?? null,
+                        });
+                        boundDatasetId = created.uuid;
+                    }
+                    // Propagate to each child scrape job via the shared options object
+                    // (flows into request.userData.options.dataset -> Base.ts writer).
+                    (coordinatorPayload.options as any).dataset = {
+                        datasetId: boundDatasetId,
+                        scopeType: "batch",
+                        mapping: datasetMapping,
+                        owner: datasetOwner,
+                    };
+                } catch (dsError) {
+                    if (dsError instanceof DatasetWriteError) {
+                        req.creditsUsed = 0;
+                        req.billingChargeDetails = undefined;
+                        res.status(dsError.httpStatus).json({ success: false, error: dsError.code, message: dsError.message });
+                        return;
+                    }
+                    throw dsError;
+                }
+            }
+
             // Pre-flight credit estimate (charging happens per successful URL in the coordinator).
             if (req.auth && appConfig.authEnabled && appConfig.creditsEnabled) {
                 const userCredits = req.auth.credits;
@@ -212,6 +275,7 @@ export class BatchScrapeController {
                     options: coordinatorPayload.options,
                     total: coordinatorPayload.urls.length,
                     limit: coordinatorPayload.urls.length,
+                    ...(boundDatasetId ? { dataset_id: boundDatasetId } : {}),
                     ...(isTemplate ? { template_id: rawBody.template_id, template_credits: templateCredits } : {}),
                 },
             });
@@ -241,6 +305,7 @@ export class BatchScrapeController {
                     job_id: jobId,
                     status: "created",
                     total: validUrls.length,
+                    ...(boundDatasetId ? { dataset_id: boundDatasetId } : {}),
                     ...(invalidUrls.length > 0 ? { invalid_urls: invalidUrls } : {}),
                     message: "Batch scrape job has been queued for processing",
                 },
@@ -310,6 +375,7 @@ export class BatchScrapeController {
                     completed: job.completed ?? 0,
                     failed: job.failed ?? 0,
                     credits_used: job.creditsUsed ?? 0,
+                    ...((job.payload as any)?.dataset_id ? { dataset_id: (job.payload as any).dataset_id } : {}),
                     expires_at: job.jobExpireAt ? new Date(job.jobExpireAt).toISOString() : undefined,
                 },
             });

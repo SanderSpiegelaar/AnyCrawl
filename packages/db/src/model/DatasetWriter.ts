@@ -28,7 +28,7 @@ const PLATFORM_HASH_EXCLUDE_PATHS = [
     "/scrapedAt",
 ];
 
-export type DatasetScopeType = "scrape" | "crawl" | "search" | "orchestrated";
+export type DatasetScopeType = "scrape" | "crawl" | "search" | "batch" | "orchestrated";
 
 export interface DatasetProjectionSpec {
     name: string;
@@ -185,6 +185,11 @@ export class DatasetWriter {
     static standardMapping(scopeType: DatasetScopeType): DatasetMapping {
         switch (scopeType) {
             case "scrape":
+                return { name: "anycrawl_scrape", version: "1.0.0" };
+            case "batch":
+                // Batch scrape produces the same per-page shape as a single scrape, so
+                // it shares the scrape schema — batch and scrape results are therefore
+                // interchangeable into the same dataset (name + major match).
                 return { name: "anycrawl_scrape", version: "1.0.0" };
             case "crawl":
                 return { name: "anycrawl_crawl_page", version: "1.0.0" };
@@ -672,7 +677,7 @@ export class DatasetWriter {
             return { candidates, warnings, seen: results.length };
         }
 
-        // scrape / crawl: the whole page is one item keyed by its normalized URL.
+        // scrape / batch / crawl: the whole page is one item keyed by its normalized URL.
         const url = this.readUrl(result);
         if (!url) {
             return {

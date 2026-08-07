@@ -8,6 +8,7 @@ import {
     updateJobStatus,
     updateJobCounts,
     chargeDeltaByJobId,
+    finalizeCrawlDatasetRun,
     STATUS,
 } from "@anycrawl/db";
 
@@ -42,6 +43,22 @@ export async function runBatchScrape(jobId: string, payload: any): Promise<void>
         extract_source: options.extract_source,
     }, { templateCredits });
     const perUrlCost = perUrlChargeDetails.total;
+
+    // Dataset binding (present only when the request carried output.dataset). Child
+    // scrape jobs write each page via the Writer (Base.ts); the coordinator finalizes
+    // the single per-batch dataset_run once draining ends.
+    const boundDatasetId: string | undefined =
+        options?.dataset?.datasetId && typeof options.dataset.datasetId === "string"
+            ? options.dataset.datasetId
+            : undefined;
+    const finalizeDatasetRun = async (): Promise<void> => {
+        if (!boundDatasetId) return;
+        try {
+            await finalizeCrawlDatasetRun({ datasetId: boundDatasetId, producerId: jobId, producerType: "batch" });
+        } catch (e) {
+            log.warning(`[BatchScrape] ${jobId} failed to finalize dataset run: ${e instanceof Error ? e.message : e}`);
+        }
+    };
 
     let completed = 0;
     let failed = 0;
@@ -131,6 +148,10 @@ export async function runBatchScrape(jobId: string, payload: any): Promise<void>
             }
         } catch { /* ignore read errors and proceed to finalize */ }
 
+        // All draining done: finalize the per-batch dataset run (idempotent no-op when
+        // no dataset was bound or the run is already terminal).
+        await finalizeDatasetRun();
+
         if (completed === 0 && failed > 0) {
             await failedJob(jobId, "No URLs were successfully scraped", false, {
                 total: completed + failed,
@@ -160,6 +181,8 @@ export async function runBatchScrape(jobId: string, payload: any): Promise<void>
     } catch (err) {
         const msg = err instanceof Error ? err.message : "Batch scrape coordinator failed";
         log.error(`[BatchScrape] ${jobId} failed: ${msg}`);
+        // Finalize whatever pages were written before the crash (idempotent).
+        await finalizeDatasetRun();
         await failedJob(jobId, msg, false, {
             total: completed + failed,
             completed,

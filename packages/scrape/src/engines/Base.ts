@@ -1266,7 +1266,11 @@ export abstract class BaseEngine {
                                 jobId: crawlJobId,
                                 scope: { kind: "job", jobId: crawlJobId },
                                 scopeType: "crawl",
-                                result: data,
+                                // `data` has no guaranteed top-level url; the Writer keys the
+                                // item by result.url, so inject it (same shape as the cached
+                                // result at { url, ...data }). Without this every page maps to
+                                // missing_item_key and nothing is written.
+                                result: { url: context.request.url, ...data },
                                 mapping: dsConfig.mapping,
                                 owner: dsConfig.owner,
                                 dataset: { datasetId: dsConfig.datasetId },
@@ -1276,6 +1280,46 @@ export abstract class BaseEngine {
                         } catch (datasetError) {
                             log.warning(
                                 `[${context.request.userData.queueName}] [${crawlJobId}] Dataset write failed for ${context.request.url}: ${datasetError instanceof Error ? datasetError.message : String(datasetError)}`
+                            );
+                        }
+                    }
+
+                    // Dataset output (additive): batch scrape child jobs carry the
+                    // binding on options.dataset. Sync single-scrape writes in-controller
+                    // (never sets options.dataset), so this fires only for batch children
+                    // — no double write. Key the run by the batch job (parentId) so every
+                    // URL of a batch maps to a SINGLE dataset_run. Fully isolated.
+                    if (
+                        !isHttpError &&
+                        context.request.userData.type === JOB_TYPE_SCRAPE &&
+                        context.request.userData.options?.dataset
+                    ) {
+                        const dsConfig = context.request.userData.options.dataset as {
+                            datasetId: string;
+                            scopeType: "batch";
+                            mapping: any;
+                            owner: any;
+                        };
+                        const batchJobId = (context.request.userData.parentId || context.request.userData.jobId) as string;
+                        try {
+                            await writeResultToDataset({
+                                producerType: "batch",
+                                producerId: batchJobId,
+                                jobId: batchJobId,
+                                scope: { kind: "job", jobId: batchJobId },
+                                scopeType: "batch",
+                                // Inject the url (item key) — `data` has no guaranteed top-level
+                                // url; without this the page maps to missing_item_key.
+                                result: { url: context.request.url, ...data },
+                                mapping: dsConfig.mapping,
+                                owner: dsConfig.owner,
+                                dataset: { datasetId: dsConfig.datasetId },
+                                // Per-URL write of a multi-URL run: accumulate, don't finalize.
+                                finalizeRun: false,
+                            });
+                        } catch (datasetError) {
+                            log.warning(
+                                `[${context.request.userData.queueName}] [${batchJobId}] Dataset write failed for ${context.request.url}: ${datasetError instanceof Error ? datasetError.message : String(datasetError)}`
                             );
                         }
                     }
