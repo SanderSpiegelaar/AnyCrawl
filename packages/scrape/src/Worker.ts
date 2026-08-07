@@ -98,7 +98,7 @@ function parseQueueArgs(): { queues: string[], schedulerOnly: boolean } {
 
 // Engine-independent queues (no browser engine required). These can be started
 // on their own via --queues=<name> without initializing any scrape/crawl engine.
-const ENGINE_INDEPENDENT_QUEUES = new Set<string>(["scheduler", "template-run"]);
+const ENGINE_INDEPENDENT_QUEUES = new Set<string>(["scheduler", "template-run", "dataset-export"]);
 
 const { queues: requestedQueues, schedulerOnly } = parseQueueArgs();
 
@@ -113,6 +113,10 @@ const enginesEnabled = !schedulerOnly
 // plain scrape jobs onto the existing scrape-<engine> queues (consumed by the
 // scrape workers) rather than driving an engine itself.
 const shouldStartTemplateRun = requestedQueues.length === 0 || requestedQueues.includes('template-run');
+
+// The Dataset export worker is engine-independent: it reads dataset items and
+// uploads a JSONL/CSV file to storage, never touching a scrape/crawl engine.
+const shouldStartDatasetExport = requestedQueues.length === 0 || requestedQueues.includes('dataset-export');
 
 // Initialize Utils first
 const utils = Utils.getInstance();
@@ -281,6 +285,18 @@ async function runJob(job: Job) {
                 })
             );
             log.info("✅ Template Run (orchestrated) worker registered");
+        }
+
+        // Worker for the Dataset export queue (async JSONL/CSV export jobs —
+        // platform §11 exports / master-plan §3.2). Engine-independent.
+        if (shouldStartDatasetExport) {
+            workers.push(
+                WorkerManager.getInstance().getWorker('dataset-export', async (job: Job) => {
+                    const { DatasetExportProcessor } = await import("./dataset/DatasetExportProcessor.js");
+                    await new DatasetExportProcessor().run(job.data);
+                })
+            );
+            log.info("✅ Dataset Export worker registered");
         }
 
         // Workers for scrape and crawl jobs (only when engines are enabled)

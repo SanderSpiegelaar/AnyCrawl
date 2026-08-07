@@ -681,6 +681,27 @@ export const runWarnings = p.pgTable("run_warnings", {
     p.index("ix_run_warnings_code").on(t.datasetRunId, t.code),
 ]);
 
+// Dataset export jobs (platform §11 exports / master-plan §3.2). One row per
+// requested export (JSONL/CSV), driven by an async `dataset-export` queue job:
+// queued -> running -> {completed|failed}. `file_key` is the S3 object key
+// (dataset-exports/{datasetId}/{exportId}.{format}), filled on completion; the
+// controller mints a fresh presigned download URL from it on each read rather
+// than persisting one (presigned URLs expire).
+export const datasetExports = p.pgTable("dataset_exports", {
+    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
+    datasetId: p.uuid("dataset_id").notNull().references(() => datasets.uuid, { onDelete: "cascade" }),
+    format: p.text("format").notNull(),
+    status: p.text("status").notNull().default("queued"),
+    itemCount: p.integer("item_count"),
+    fileKey: p.text("file_key"),
+    error: p.text("error"),
+    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
+    updatedAt: p.timestamp("updated_at", { withTimezone: true }).notNull(),
+    completedAt: p.timestamp("completed_at", { withTimezone: true }),
+}, (t) => [
+    p.index("ix_dataset_export_cursor").on(t.datasetId, t.createdAt, t.uuid),
+]);
+
 // ============================================================================
 // Template Revisions (L3) — immutable template version snapshots (platform §9.1).
 // A revision freezes the full execution config + output schema for a template so

@@ -30,6 +30,7 @@ import {
 } from "./model/DatasetAccess.js";
 import { Dataset } from "./model/Dataset.js";
 import { DatasetWriter } from "./model/DatasetWriter.js";
+import { DatasetExport } from "./model/DatasetExport.js";
 import { TemplateRevision } from "./model/TemplateRevision.js";
 import { TemplateRun } from "./model/TemplateRun.js";
 import { TemplateRunRequest } from "./model/TemplateRunRequest.js";
@@ -141,6 +142,13 @@ export const listDatasetRunItems = Dataset.listRunItems;
 export const listDatasetChanges = Dataset.listChanges;
 export const listRunWarnings = Dataset.listRunWarnings;
 
+// Dataset exports (async JSONL/CSV export jobs — platform §11 exports / master-plan §3.2)
+export const createDatasetExport = DatasetExport.create;
+export const listDatasetExports = DatasetExport.list;
+export const getDatasetExport = DatasetExport.get;
+export const updateDatasetExportStatus = DatasetExport.updateStatus;
+export type { DatasetExportFormat, DatasetExportStatus, DatasetExportUpdatePatch } from "./model/DatasetExport.js";
+
 // Dataset Writer (producer write-path service). Additive: only invoked when a
 // request carries `output.dataset` — the no-dataset path is untouched.
 export const writeResultToDataset = DatasetWriter.writeResultToDataset.bind(DatasetWriter);
@@ -203,9 +211,10 @@ export {
     datasetItemScopes,
     datasetItemChanges,
     runWarnings,
+    datasetExports,
 } from "./db/schemas/PostgreSQL.js";
 
-export { eq, and, gt, gte, sql, desc, getDB, schemas, STATUS, JOB_RESULT_STATUS, Job, Billing, Dataset, TemplateRevision, TemplateRun, TemplateRunRequest };
+export { eq, and, gt, gte, sql, desc, getDB, schemas, STATUS, JOB_RESULT_STATUS, Job, Billing, Dataset, DatasetExport, TemplateRevision, TemplateRun, TemplateRunRequest };
 export { TEMPLATE_RUN_TERMINAL_STATUSES } from "./model/TemplateRun.js";
 export type { CreateJobParams, CreateTemplateParams };
 export type { FreezeRevisionParams } from "./model/TemplateRevision.js";

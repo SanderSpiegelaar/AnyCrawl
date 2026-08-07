@@ -655,6 +655,23 @@ export const runWarnings = p.sqliteTable("run_warnings", {
     p.index("ix_run_warnings_code").on(t.datasetRunId, t.code),
 ]);
 
+// Dataset export jobs — SQLite parallel of the PostgreSQL dataset_exports table
+// (see PostgreSQL.ts for the full rationale). Same table/column/index names.
+export const datasetExports = p.sqliteTable("dataset_exports", {
+    uuid: p.text("uuid").primaryKey().$defaultFn(() => randomUUID()),
+    datasetId: p.text("dataset_id").notNull().references(() => datasets.uuid, { onDelete: "cascade" }),
+    format: p.text("format").notNull(),
+    status: p.text("status").notNull().default("queued"),
+    itemCount: p.integer("item_count"),
+    fileKey: p.text("file_key"),
+    error: p.text("error"),
+    createdAt: p.integer("created_at", { mode: "timestamp" }).notNull(),
+    updatedAt: p.integer("updated_at", { mode: "timestamp" }).notNull(),
+    completedAt: p.integer("completed_at", { mode: "timestamp" }),
+}, (t) => [
+    p.index("ix_dataset_export_cursor").on(t.datasetId, t.createdAt, t.uuid),
+]);
+
 // ============================================================================
 // Template Revisions (L3) — SQLite parallel of platform §9.1. Type substitutions:
 // uuid->text, jsonb->text{json}, timestamp->integer{timestamp}. Same table/column/

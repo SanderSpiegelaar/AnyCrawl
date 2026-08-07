@@ -111,6 +111,9 @@ router.get("/datasets/:id/runs/:run_id", controllerWrapper(datasetController.run
 router.get("/datasets/:id/runs/:run_id/items", controllerWrapper(datasetController.runItems));
 router.get("/datasets/:id/runs/:run_id/warnings", controllerWrapper(datasetController.runWarnings));
 router.get("/datasets/:id/changes", controllerWrapper(datasetController.changes));
+router.post("/datasets/:id/exports", controllerWrapper(datasetController.createExport));
+router.get("/datasets/:id/exports", controllerWrapper(datasetController.listExports));
+router.get("/datasets/:id/exports/:export_id", controllerWrapper(datasetController.getExport));
 
 // Error handler
 router.use(((err, req, res, next) => {

@@ -176,6 +176,13 @@
       "when": 1786082562506,
       "tag": "0024_dataset_jsonb_query",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1786099820814,
+      "tag": "0025_sticky_wither",
+      "breakpoints": true
     }
   ]
 }

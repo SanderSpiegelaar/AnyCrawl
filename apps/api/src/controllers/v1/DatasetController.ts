@@ -1,6 +1,7 @@
 import { Response } from "express";
 import { z } from "zod";
-import { RequestWithAuth, type OwnerContext, log } from "@anycrawl/libs";
+import { RequestWithAuth, type OwnerContext, log, s3 } from "@anycrawl/libs";
+import { QueueManager } from "@anycrawl/scrape";
 import {
     getDB,
     createDataset,
@@ -15,6 +16,9 @@ import {
     listDatasetRunItems,
     listDatasetChanges,
     listRunWarnings,
+    createDatasetExport,
+    listDatasetExports,
+    getDatasetExport,
     type DatasetItemFilter,
     type DatasetItemSort,
     type DatasetPageResult,
@@ -40,6 +44,10 @@ const createDatasetSchema = z.object({
             change_days: z.number().int().positive().optional(),
         })
         .optional(),
+});
+
+const createExportSchema = z.object({
+    format: z.enum(["jsonl", "csv"]),
 });
 
 const updateDatasetSchema = z.object({
@@ -372,6 +380,88 @@ export class DatasetController {
                 until: until ?? undefined,
             });
             this.sendList(res, "changes", page, this.serializeChanges(page.items));
+        } catch (error) {
+            this.handleError(error, res);
+        }
+    };
+
+    // --- Exports ---------------------------------------------------------------
+
+    /** POST /v1/datasets/:id/exports */
+    public createExport = async (req: RequestWithAuth, res: Response): Promise<void> => {
+        try {
+            const data = createExportSchema.parse(req.body);
+            const owner = this.getOwnerContext(req);
+            const db = await getDB();
+
+            const dataset = await getOwnedDataset(db, req.params.id!, owner);
+            if (!dataset) {
+                this.notFound(res, "dataset_not_found");
+                return;
+            }
+
+            const exportRow = await createDatasetExport(db, {
+                datasetId: req.params.id!,
+                format: data.format,
+            });
+
+            await QueueManager.getInstance().addDatasetExportJob({
+                type: "dataset-export",
+                exportId: exportRow.uuid,
+                datasetId: req.params.id!,
+                format: data.format,
+            });
+
+            res.status(201).json({ success: true, data: serializeRecord(exportRow) });
+        } catch (error) {
+            this.handleError(error, res);
+        }
+    };
+
+    /** GET /v1/datasets/:id/exports */
+    public listExports = async (req: RequestWithAuth, res: Response): Promise<void> => {
+        try {
+            const owner = this.getOwnerContext(req);
+            const db = await getDB();
+            const dataset = await getOwnedDataset(db, req.params.id!, owner);
+            if (!dataset) {
+                this.notFound(res, "dataset_not_found");
+                return;
+            }
+            const limit = this.parseLimit(req.query.limit);
+            const cursor = this.parseCursor(req, res);
+            if (cursor === false) return;
+
+            const page = await listDatasetExports(db, req.params.id!, { limit, cursor });
+            this.sendList(res, "exports", page, serializeRecords(page.items));
+        } catch (error) {
+            this.handleError(error, res);
+        }
+    };
+
+    /** GET /v1/datasets/:id/exports/:export_id */
+    public getExport = async (req: RequestWithAuth, res: Response): Promise<void> => {
+        try {
+            const owner = this.getOwnerContext(req);
+            const db = await getDB();
+            const dataset = await getOwnedDataset(db, req.params.id!, owner);
+            if (!dataset) {
+                this.notFound(res, "dataset_not_found");
+                return;
+            }
+            const exportRow = await getDatasetExport(db, req.params.id!, req.params.export_id!);
+            if (!exportRow) {
+                this.notFound(res, "dataset_export_not_found");
+                return;
+            }
+
+            const data = serializeRecord<Record<string, unknown>>(exportRow);
+            // Presigned URLs expire — mint a fresh one on every read rather than
+            // persisting it on the row.
+            if (exportRow.status === "completed" && exportRow.fileKey) {
+                data.download_url = await s3.getTemporaryUrl(exportRow.fileKey);
+            }
+            res.json({ success: true, data });
         } catch (error) {
             this.handleError(error, res);
         }

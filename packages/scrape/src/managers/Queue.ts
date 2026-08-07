@@ -35,6 +35,19 @@ export interface TemplateRunJobPayload {
     queueName?: QueueName;
 }
 
+/**
+ * Payload for a queued Dataset export job (`dataset-export` queue). The job is
+ * keyed by `exportId` (stable BullMQ jobId) so a retry re-enters the SAME
+ * export instead of creating a duplicate (same idempotency reasoning as
+ * `TemplateRunJobPayload`/`runId`).
+ */
+export interface DatasetExportJobPayload {
+    type: "dataset-export";
+    exportId: string;
+    datasetId: string;
+    format: "jsonl" | "csv";
+}
+
 export interface RequestTaskOptions {
     headless?: boolean;
     proxy?: string;
@@ -169,6 +182,33 @@ export class QueueManager {
         const queue = this.getQueue(queueName);
         const jobId = payload.runId;
         log.info(`Adding template-run job to queue ${queueName} with runId ${jobId}`);
+        await queue.add(
+            queueName,
+            { ...payload, queueName },
+            {
+                jobId,
+                attempts: 3,
+                backoff: {
+                    type: "exponential",
+                    delay: 1000,
+                },
+            }
+        );
+        return jobId;
+    }
+
+    /**
+     * Enqueue a Dataset export onto the engine-independent `dataset-export`
+     * queue. The BullMQ jobId is pinned to `payload.exportId`, so a duplicate
+     * enqueue for the same export is a no-op and a BullMQ retry re-enters the
+     * same export rather than creating a duplicate. Returns the exportId used
+     * as the jobId.
+     */
+    public async addDatasetExportJob(payload: DatasetExportJobPayload): Promise<string> {
+        const queueName = "dataset-export";
+        const queue = this.getQueue(queueName);
+        const jobId = payload.exportId;
+        log.info(`Adding dataset-export job to queue ${queueName} with exportId ${jobId}`);
         await queue.add(
             queueName,
             { ...payload, queueName },

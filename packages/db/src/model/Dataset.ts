@@ -194,14 +194,38 @@ function projectionKeyset(
 
 /**
  * Keyset predicate for a real timestamp column (created_at / last_seen_at). The
- * cursor value is epoch millis; drizzle encodes the Date per dialect.
+ * cursor value is epoch millis; drizzle encodes the Date per dialect. Exported
+ * so sibling child-table models (e.g. DatasetExport) reuse the same keyset
+ * logic instead of reimplementing timestamp-cursor pagination.
  */
-function timestampKeyset(col: any, uuidCol: any, dir: "asc" | "desc", cursor: CursorKey): any {
+export function timestampKeyset(col: any, uuidCol: any, dir: "asc" | "desc", cursor: CursorKey): any {
     const d = new Date(Number(cursor.v));
     if (dir === "desc") {
         return or(lt(col, d), and(eq(col, d), lt(uuidCol, cursor.id)));
     }
     return or(gt(col, d), and(eq(col, d), gt(uuidCol, cursor.id)));
+}
+
+/**
+ * Trim a limit+1 fetch and derive the next timestamp cursor from the last row.
+ * Exported standalone (mirrored by `Dataset.finalizeTimestamp` below for
+ * existing in-class call sites) so sibling child-table models reuse it too.
+ */
+export function finalizeTimestampPage(
+    rows: any[],
+    limit: number,
+    getDate: (row: any) => Date | number | null
+): PageResult {
+    const hasMore = rows.length > limit;
+    const items = hasMore ? rows.slice(0, limit) : rows;
+    const last = items[items.length - 1];
+    let nextCursor: CursorKey | null = null;
+    if (hasMore && last) {
+        const d = getDate(last);
+        const millis = d instanceof Date ? d.getTime() : typeof d === "number" ? d : null;
+        nextCursor = { v: millis, id: last.uuid };
+    }
+    return { items, nextCursor };
 }
 
 /** Keyset predicate for an arbitrary SQL sort expression (projection sort / sequence). */
@@ -579,15 +603,6 @@ export class Dataset {
         limit: number,
         getDate: (row: any) => Date | number | null
     ): PageResult {
-        const hasMore = rows.length > limit;
-        const items = hasMore ? rows.slice(0, limit) : rows;
-        const last = items[items.length - 1];
-        let nextCursor: CursorKey | null = null;
-        if (hasMore && last) {
-            const d = getDate(last);
-            const millis = d instanceof Date ? d.getTime() : typeof d === "number" ? d : null;
-            nextCursor = { v: millis, id: last.uuid };
-        }
-        return { items, nextCursor };
+        return finalizeTimestampPage(rows, limit, getDate);
     }
 }
