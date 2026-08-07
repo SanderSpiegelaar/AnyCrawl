@@ -214,9 +214,9 @@ describe("TemplateRunController.create", () => {
         // is not a `jobs` row (legacy_job_uuid FKs to jobs). The BullMQ jobId == run.uuid.
         const statusCall = (updateTemplateRunStatus as jest.Mock).mock.calls.find(
             (c: any[]) => c[0] === "run-uuid-1" && c[1]?.status === "running"
-        );
+        ) as any[] | undefined;
         expect(statusCall).toBeTruthy();
-        expect(statusCall![1].legacyJobUuid).toBeUndefined();
+        expect((statusCall as any[])[1].legacyJobUuid).toBeUndefined();
         expect(res.statusCode).toBe(202);
         expect(res.body.success).toBe(true);
         expect(res.body.data.status).toBe("running");

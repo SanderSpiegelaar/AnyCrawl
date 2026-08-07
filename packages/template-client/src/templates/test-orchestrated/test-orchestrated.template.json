@@ -1,0 +1,111 @@
+{
+  "uuid": "7e57e57e-0002-4a1e-8b02-7e57e57e0002",
+  "templateId": "test-orchestrated",
+  "slug": null,
+  "name": "Test Orchestrated",
+  "description": "Minimal, reachable orchestrated template for end-to-end verification. Expands a `urls` array into one seed per URL, fetches each page via a cheerio scrape, extracts a single item (title + first paragraph), and writes it to a Dataset. No pagination or detail requests.",
+  "tags": [
+    "test",
+    "orchestrated",
+    "example",
+    "smoke"
+  ],
+  "version": "1.0.0",
+  "pricing": {
+    "perCall": 1,
+    "currency": "credits"
+  },
+  "templateType": "scrape",
+  "reqOptions": {
+    "engine": "cheerio",
+    "formats": [
+      "rawHtml",
+      "markdown"
+    ],
+    "timeout": 30000,
+    "retry": true
+  },
+  "runtime": {
+    "mode": "orchestrated",
+    "handlerProtocolVersion": "1",
+    "seedBuilder": {
+      "type": "handler",
+      "name": "seedHandler"
+    },
+    "defaultRunOptions": {
+      "max_items": 100,
+      "max_pages_per_seed": 1,
+      "max_concurrency": 2,
+      "max_run_time_seconds": 300,
+      "max_seeds": 50
+    }
+  },
+  "outputSchema": {
+    "name": "test_orchestrated",
+    "version": "1.0.0",
+    "itemsPath": "/items",
+    "itemKeyPath": "/itemKey",
+    "hashExcludePaths": [
+      "/provenance/scrapedAt"
+    ],
+    "projections": [
+      {
+        "field": "title",
+        "path": "/title",
+        "type": "string"
+      }
+    ]
+  },
+  "customHandlers": {
+    "seedHandler": {
+      "enabled": true,
+      "code": {
+        "language": "javascript",
+        "source": "// test-orchestrated :: seedHandler (orchestrated seed builder)\n//\n// This file is the readable / node-checkable mirror of\n//   test-orchestrated.template.json -> customHandlers.seedHandler.code.source\n// The JSON embeds this exact text as an inline string; keep the two in sync\n// (regenerate the JSON from this file). The runtime executes this body inside\n// the non-trusted VM sandbox as an async function body, so it may use top-level\n// `return` and the sandbox globals `variables` and `template`. Sandbox rules:\n// no module loading, no process access, no DOM APIs. Only standard ECMAScript\n// intrinsics plus JSON / Math / Date / RegExp are available.\n//\n// Contract (docs/design/template-runs-datasets-platform.md 7.2):\n//   returns { seeds: [ { seedKey, url, metadata } ], warnings: [] }\n//\n// This minimal template fans a single `urls` array variable out into one seed\n// per URL (seedKey = the array index) so an orchestrated run can prove both\n// seed expansion and multi-seed fan-out against reliably reachable pages.\n\nconst v = (variables && typeof variables === \"object\") ? variables : {};\nconst rawUrls = Array.isArray(v.urls) ? v.urls : [];\n\nconst seeds = [];\nconst warnings = [];\n\nrawUrls.forEach((entry, i) => {\n    const url = typeof entry === \"string\" ? entry.trim() : \"\";\n    if (!url) {\n        warnings.push({\n            code: \"invalid_url\",\n            message: \"urls[\" + i + \"] is not a non-empty string\",\n        });\n        return;\n    }\n    seeds.push({\n        seedKey: String(i),\n        url: url,\n        metadata: {\n            seedKey: String(i),\n            index: i,\n            sourceUrl: url,\n        },\n    });\n});\n\nreturn { seeds: seeds, warnings: warnings };\n"
+      }
+    },
+    "requestHandler": {
+      "enabled": true,
+      "code": {
+        "language": "javascript",
+        "source": "// test-orchestrated :: requestHandler (orchestrated page handler)\n//\n// Readable / node-checkable mirror of\n//   test-orchestrated.template.json -> customHandlers.requestHandler.code.source\n// The JSON embeds this exact text as an inline string; keep the two in sync\n// (regenerate the JSON from this file). The runtime executes this body inside\n// the non-trusted VM sandbox as an async function body (top-level `return`\n// allowed). Only standard ECMAScript intrinsics plus the sandbox globals\n// context / template / variables / JSON / Math / Date / RegExp are available:\n// no module loading, no DOM, no cheerio. The page HTML is therefore parsed\n// defensively with regex / string scanning only.\n//\n// Contract (docs/design/template-runs-datasets-platform.md 7.2):\n//   returns { items: [Item], nextUrl: string|null, detailRequests: [], warnings: [] }\n//\n// This minimal template extracts exactly one item per page (title + first\n// paragraph) and never paginates — a single page per seed is enough to prove\n// the fetch -> extract -> Dataset-write loop; the multi-URL seedHandler proves\n// fan-out.\n\n// ---------------------------------------------------------------- helpers ---\nconst stripTags = (s) => String(s == null ? \"\" : s).replace(/<[^>]*>/g, \" \");\nconst decodeEntities = (s) =>\n    String(s == null ? \"\" : s)\n        .replace(/&amp;/gi, \"&\")\n        .replace(/&lt;/gi, \"<\")\n        .replace(/&gt;/gi, \">\")\n        .replace(/&quot;/gi, '\"')\n        .replace(/&#0*39;|&#x0*27;|&apos;/gi, \"'\")\n        .replace(/&nbsp;/gi, \" \");\nconst cleanText = (s) => decodeEntities(stripTags(s)).replace(/\\s+/g, \" \").trim();\n\n// Return the first capturing-group value that matches any of the patterns.\nconst firstMatch = (str, patterns) => {\n    let out = null;\n    patterns.some((re) => {\n        const m = String(str).match(re);\n        if (m && m[1] != null && String(m[1]).trim() !== \"\") {\n            out = m[1];\n            return true;\n        }\n        return false;\n    });\n    return out;\n};\n\n// Deterministic itemKey: drop the fragment and any trailing slash so the same\n// page always hashes to the same key across runs.\nconst normalizeUrl = (u) => {\n    if (!u) return null;\n    let s = String(u).trim();\n    const hashIdx = s.indexOf(\"#\");\n    if (hashIdx !== -1) s = s.substring(0, hashIdx);\n    s = s.replace(/\\/+$/, \"\");\n    return s || null;\n};\n\n// ------------------------------------------------------------ inputs / ctx ---\nconst ctx = (typeof context !== \"undefined\" && context) ? context : {};\nconst data = ctx.data || {};\nconst scrape = data.scrapeResult || {};\nconst html =\n    (typeof ctx.html === \"string\" && ctx.html) ||\n    scrape.rawHtml ||\n    scrape.html ||\n    data.rawHtml ||\n    \"\";\nconst pageUrl =\n    scrape.url || (data.request && data.request.url) || data.url || \"\";\n\nconst run = data.run || {};\nconst seedKey =\n    run.seedKey != null\n        ? String(run.seedKey)\n        : (data.seedMeta && data.seedMeta.seedKey != null ? String(data.seedMeta.seedKey) : null);\nconst scrapedAt = new Date().toISOString();\n\nconst H = String(html);\nconst items = [];\nconst warnings = [];\n\nconst normUrl = normalizeUrl(pageUrl) || pageUrl || null;\n\n// title: <title> first, else first <h1>.\nconst title =\n    cleanText(firstMatch(H, [/<title[^>]*>([\\s\\S]*?)<\\/title>/i])) ||\n    cleanText(firstMatch(H, [/<h1[^>]*>([\\s\\S]*?)<\\/h1>/i])) ||\n    null;\n\n// text: first <p>, tag-stripped + entity-decoded, truncated.\nconst rawText = firstMatch(H, [/<p[^>]*>([\\s\\S]*?)<\\/p>/i]);\nlet text = rawText ? cleanText(rawText) : null;\nif (text && text.length > 500) text = text.substring(0, 500).trim() + \"…\";\n\nif (!normUrl) {\n    warnings.push({ code: \"missing_page_url\", message: \"no url on scrapeResult\" });\n} else {\n    items.push({\n        itemKey: normUrl,\n        url: normUrl,\n        title: title,\n        text: text,\n        provenance: { seedKey: seedKey, scrapedAt: scrapedAt },\n    });\n}\n\nreturn { items: items, nextUrl: null, detailRequests: [], warnings: warnings };\n"
+      }
+    }
+  },
+  "metadata": {
+    "allowedDomains": {
+      "type": "glob",
+      "patterns": [
+        "example.com",
+        "*.example.com",
+        "www.iana.org",
+        "*.iana.org"
+      ]
+    },
+    "debug": false
+  },
+  "variables": {
+    "urls": {
+      "type": "array",
+      "label": "URLs",
+      "description": "Reachable pages to scrape. The seedHandler emits one seed per URL (seedKey = array index).",
+      "required": true,
+      "minItems": 1,
+      "maxItems": 50,
+      "items": {
+        "type": "url"
+      },
+      "defaultValue": [
+        "https://example.com",
+        "https://www.iana.org/help/example-domains"
+      ]
+    }
+  },
+  "createdBy": "system-admin",
+  "publishedBy": "system-admin",
+  "reviewedBy": "system-admin",
+  "status": "published",
+  "reviewStatus": "approved",
+  "reviewNotes": "Minimal orchestrated smoke-test template (seed fan-out + single-item page handler).",
+  "trusted": false
+}

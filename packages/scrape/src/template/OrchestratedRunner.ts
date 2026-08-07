@@ -276,7 +276,7 @@ export class OrchestratedRunner {
             // --- Fetch the page (plain scrape job, no template_id) ---
             let page: FetchedPage;
             try {
-                page = await this.fetchPage(engine, req.normalizedUrl, payload);
+                page = await this.fetchPage(engine, req.normalizedUrl, payload, (templateConfig as any)?.reqOptions ?? {});
             } catch (e) {
                 anyPageFailed = true;
                 coverageComplete = false;
@@ -514,18 +514,32 @@ export class OrchestratedRunner {
     private async fetchPage(
         engine: string,
         url: string,
-        payload: TemplateRunJobPayload
+        payload: TemplateRunJobPayload,
+        reqOptions: Record<string, any> = {}
     ): Promise<FetchedPage> {
         if (this.fetchPageImpl) return this.fetchPageImpl(engine, url, payload);
 
         const queueName = `scrape-${engine}`;
-        const scrapeTimeout = Number((payload.runOptions as any)?.request_timeout_ms) || 30000;
+        const scrapeTimeout =
+            Number((reqOptions as any)?.timeout) ||
+            Number((payload.runOptions as any)?.request_timeout_ms) ||
+            30000;
+
+        // Honor the template's scrape config (proxy, wait_for, wait_until, etc.) so each
+        // template controls how its pages are fetched (e.g. Craigslist needs proxies).
+        // engine/type/formats are owned by the orchestrator: rawHtml is required by the
+        // page handler, so it's always included regardless of the template's formats.
+        const { engine: _e, type: _t, formats: tplFormats, timeout: _to, ...restReqOptions } =
+            (reqOptions as any) || {};
+        const formats = Array.from(
+            new Set(["rawHtml", "markdown", ...(Array.isArray(tplFormats) ? tplFormats : [])])
+        );
 
         const jobId = await QueueManager.getInstance().addJob(queueName, {
             url,
             engine: engine as any,
             type: "scrape",
-            options: { formats: ["rawHtml", "markdown"], timeout: scrapeTimeout },
+            options: { ...restReqOptions, formats, timeout: scrapeTimeout },
         });
 
         // Ensure a jobs row exists so Base.ts's insertJobResult + getJobResults
