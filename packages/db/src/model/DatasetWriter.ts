@@ -215,19 +215,26 @@ export class DatasetWriter {
 
         const ret = d.return === "items" ? "items" : "result";
 
-        const datasetId = d.dataset_id;
+        // dataset_id may sit at output.dataset.dataset_id (canonical) or inside create.
+        const createObj =
+            d.create && typeof d.create === "object" ? (d.create as Record<string, unknown>) : null;
+        const datasetId = d.dataset_id ?? createObj?.dataset_id;
         if (typeof datasetId === "string" && datasetId.trim().length > 0) {
             return { return: ret, dataset: { datasetId: datasetId.trim() } };
         }
 
+        // Create spec is nested under `create` (canonical, matches DatasetTarget +
+        // OrchestratedRunAdapter + the dashboard selector); tolerate a flat shape too.
+        const spec = createObj ?? d;
         const name =
-            typeof d.name === "string" && d.name.trim().length > 0
-                ? d.name.trim()
+            typeof spec.name === "string" && spec.name.trim().length > 0
+                ? spec.name.trim()
                 : opts.defaultName;
-        const description = typeof d.description === "string" ? d.description : undefined;
+        const description = typeof spec.description === "string" ? spec.description : undefined;
+        const rawRetention = spec.retention ?? spec.retention_policy;
         const retention =
-            d.retention && typeof d.retention === "object"
-                ? (d.retention as { item_days?: number; change_days?: number })
+            rawRetention && typeof rawRetention === "object"
+                ? (rawRetention as { item_days?: number; change_days?: number })
                 : undefined;
         return {
             return: ret,

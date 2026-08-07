@@ -147,7 +147,9 @@ function filterCondition(f: ItemFilter): any {
 
     // Fast PG eq: single top-level key, non-timestamp → jsonb containment (GIN).
     if (!IS_SQLITE && f.op === "eq" && segs.length === 1 && f.fieldType !== "timestamptz") {
-        return sql`${schemas.datasetItems.document} @> jsonb_build_object(${segs[0]}, ${containmentValue(f.fieldType, f.values[0] ?? "")})`;
+        // Cast the key to text: jsonb_build_object is variadic "any", so an untyped
+        // bind param makes PG error "could not determine data type of parameter".
+        return sql`${schemas.datasetItems.document} @> jsonb_build_object(${segs[0]}::text, ${containmentValue(f.fieldType, f.values[0] ?? "")})`;
     }
 
     const expr = fieldExpr(segs, f.fieldType);
@@ -265,15 +267,19 @@ export class Dataset {
         name: string
     ): Promise<any | null> {
         const scope = resolveDatasetOwnerScope(owner);
-        if (scope.by === "none") return null;
         const conditions: any[] = [
             sql`${schemas.datasets.deletedAt} IS NULL`,
             eq(schemas.datasets.name, name),
         ];
         if (scope.by === "user") {
             conditions.push(eq(schemas.datasets.userId, scope.value as string));
-        } else {
+        } else if (scope.by === "apiKey") {
             conditions.push(eq(schemas.datasets.apiKey, scope.value as string));
+        } else {
+            // No auth / self-host: datasets are unowned — scope ensure-by-name to the
+            // unowned set so repeated runs still accumulate into one named dataset.
+            conditions.push(sql`${schemas.datasets.userId} IS NULL`);
+            conditions.push(sql`${schemas.datasets.apiKey} IS NULL`);
         }
         const rows = await db
             .select()
