@@ -28,6 +28,7 @@ const HARD_CAPS = {
     max_seeds: 100,
     max_items: 10000,
     max_pages_per_seed: 100,
+    max_concurrency: 10,
     max_run_time_seconds: 7200,
 } as const;
 
@@ -108,6 +109,7 @@ export class OrchestratedRunner {
         const maxSeeds = this.resolveCap("max_seeds", runOptions, templateDefaults);
         const maxItems = this.resolveCap("max_items", runOptions, templateDefaults);
         const maxPagesPerSeed = this.resolveCap("max_pages_per_seed", runOptions, templateDefaults);
+        const maxConcurrency = this.resolveCap("max_concurrency", runOptions, templateDefaults);
         const maxRunTime = this.resolveCap("max_run_time_seconds", runOptions, templateDefaults);
         const deadline = this.nowFn() + maxRunTime * 1000;
 
@@ -115,7 +117,7 @@ export class OrchestratedRunner {
         await updateTemplateRunStatus(runId, { status: "running", startedAt: new Date() });
         await appendTemplateRunEvent(runId, "run.started", {
             templateRevisionId: payload.templateRevisionId,
-            caps: { maxSeeds, maxItems, maxPagesPerSeed, maxRunTime },
+            caps: { maxSeeds, maxItems, maxPagesPerSeed, maxConcurrency, maxRunTime },
         });
 
         // --- Run-scoped accumulators ------------------------------------------
@@ -243,220 +245,250 @@ export class OrchestratedRunner {
             log.info(`[template-run] [${runId}] resuming; ${existingTotal} request(s) already in ledger`);
         }
 
-        // --- Drain loop (sequential, concurrency = 1) --------------------------
+        // --- Drain loop (bounded worker pool, concurrency = maxConcurrency) ----
+        // `workerLoop` is the exact per-request pipeline that used to be the sole
+        // sequential loop body (claim → fetch → page handler → dataset write →
+        // pagination decision), now run by up to `maxConcurrency` concurrent
+        // instances. All shared accumulators (pagesFetched, itemsFound,
+        // pagesBySeed, the *Hit/*Failed flags, stoppedHard, globalPageCounter)
+        // stay correct under interleaved-but-single-threaded JS execution because
+        // every read-modify-write on them (e.g. `itemsFound += items.length`,
+        // `globalPageCounter++`) is a single synchronous statement with no
+        // `await` in the middle — the same invariant the original sequential
+        // code already relied on.
         let stoppedHard = false;
-        for (; ;) {
-            // Reload run status for cancellation.
-            const runRow = await getTemplateRun(runId);
-            if (runRow?.status === "cancelling") {
-                cancelled = true;
-                coverageComplete = false;
-                stoppedHard = true;
-                break;
-            }
-            if (this.nowFn() > deadline) {
-                timedOut = true;
-                coverageComplete = false;
-                stoppedHard = true;
-                break;
-            }
-            if (itemsFound >= maxItems) {
-                maxItemsHit = true;
-                coverageComplete = false;
-                stoppedHard = true;
-                break;
-            }
 
-            const req: RequestRow | null = await claimNextTemplateRunRequest(runId);
-            if (!req) break; // ledger drained
+        const workerLoop = async (): Promise<void> => {
+            for (; ;) {
+                // Stop-condition checks are re-evaluated by EVERY worker before
+                // EVERY claim attempt. Multiple workers can pass these checks in
+                // the same tick right at a boundary (e.g. two workers both see
+                // itemsFound just under maxItems and both go on to claim one more
+                // request) — that small overshoot is an accepted trade-off of
+                // bounded concurrency for what is a soft cap, not a bug to chase
+                // down with locks.
+                const runRow = await getTemplateRun(runId);
+                if (runRow?.status === "cancelling") {
+                    cancelled = true;
+                    coverageComplete = false;
+                    stoppedHard = true;
+                    break;
+                }
+                if (this.nowFn() > deadline) {
+                    timedOut = true;
+                    coverageComplete = false;
+                    stoppedHard = true;
+                    break;
+                }
+                if (itemsFound >= maxItems) {
+                    maxItemsHit = true;
+                    coverageComplete = false;
+                    stoppedHard = true;
+                    break;
+                }
 
-            const seedKey = req.seedKey ?? "";
-            const pageIndex = req.pageIndex ?? 1;
+                // `claimNextTemplateRunRequest` is an atomic UPDATE...RETURNING
+                // guarded on `status = 'queued'` (TemplateRunRequest.claimNext),
+                // so concurrent workers can never claim the same row. `null` only
+                // means THIS worker found nothing to claim right now — another
+                // worker may still enqueue a `nextUrl` after this one exits, but
+                // that worker's own loop (not this one) is the one that will pick
+                // it up.
+                const req: RequestRow | null = await claimNextTemplateRunRequest(runId);
+                if (!req) break; // this worker's local supply is empty
 
-            // --- Fetch the page (plain scrape job, no template_id) ---
-            let page: FetchedPage;
-            try {
-                page = await this.fetchPage(engine, req.normalizedUrl, payload, (templateConfig as any)?.reqOptions ?? {});
-            } catch (e) {
-                anyPageFailed = true;
-                coverageComplete = false;
-                const msg = e instanceof Error ? e.message : String(e);
-                await recordWarning({
-                    scope: "page",
-                    code: "fetch_failed",
-                    message: msg,
-                    seedKey,
-                    seedIndex: req.seedIndex,
-                    pageIndex,
-                    url: req.normalizedUrl,
-                });
-                await updateTemplateRunRequestStatus(req.uuid, {
-                    status: "failed",
-                    lastError: msg,
-                    finishedAt: new Date(),
-                });
-                continue;
-            }
+                const seedKey = req.seedKey ?? "";
+                const pageIndex = req.pageIndex ?? 1;
 
-            // --- Run the page handler in the trust-branched sandbox ---
-            let handler: any;
-            try {
-                handler = await this.client.runPageHandler({
-                    templateConfig,
-                    variables: payload.variables ?? {},
-                    requestType: "page",
-                    scrapeResult: {
-                        url: page.url,
-                        rawHtml: page.rawHtml,
-                        html: page.html,
-                        markdown: page.markdown,
-                    },
-                    context: {
-                        runId,
-                        templateRevisionId: payload.templateRevisionId,
-                        seedKey,
-                        pageIndex,
-                        attempt: 1,
-                    },
-                });
-            } catch (e) {
-                anyPageFailed = true;
-                coverageComplete = false;
-                const msg = e instanceof Error ? e.message : String(e);
-                await recordWarning({
-                    scope: "page",
-                    code: "page_handler_error",
-                    message: msg,
-                    seedKey,
-                    seedIndex: req.seedIndex,
-                    pageIndex,
-                    url: req.normalizedUrl,
-                });
-                await updateTemplateRunRequestStatus(req.uuid, {
-                    status: "failed",
-                    lastError: msg,
-                    finishedAt: new Date(),
-                });
-                continue;
-            }
-
-            const items: any[] = Array.isArray(handler?.items) ? handler.items : [];
-            const nextUrl: string | null = handler?.nextUrl ?? null;
-            const detailRequests: any[] = Array.isArray(handler?.detailRequests) ? handler.detailRequests : [];
-            if (detailRequests.length > 0) {
-                // Phase 1: detail fan-out is intentionally not implemented.
-                log.info(`[template-run] [${runId}] ignoring ${detailRequests.length} detailRequest(s) (Phase 1)`);
-            }
-
-            pagesFetched++;
-            pagesBySeed.set(seedKey, (pagesBySeed.get(seedKey) ?? 0) + 1);
-
-            // --- Stream items to the Dataset Writer (isolated; never aborts) ---
-            if (items.length > 0) {
-                itemsFound += items.length;
+                // --- Fetch the page (plain scrape job, no template_id) ---
+                let page: FetchedPage;
                 try {
-                    await writeResultToDataset({
-                        producerType: "template-run",
-                        producerId: runId,
-                        jobId: runId,
-                        scope: { kind: "job", jobId: runId },
-                        scopeType: "orchestrated",
-                        result: { items },
-                        mapping: payload.dataset.mapping as any,
-                        owner: payload.dataset.owner,
-                        dataset: this.datasetTarget(payload),
-                        pageIndex: globalPageCounter++,
-                        finalizeRun: false,
-                    });
-                    itemsReturned += items.length;
+                    page = await this.fetchPage(engine, req.normalizedUrl, payload, (templateConfig as any)?.reqOptions ?? {});
                 } catch (e) {
-                    // Mirror engines/Base.ts: a dataset write failure only warns and
-                    // marks the run partial-at-finalize; it never aborts the page.
-                    anyWriteFailed = true;
+                    anyPageFailed = true;
                     coverageComplete = false;
                     const msg = e instanceof Error ? e.message : String(e);
                     await recordWarning({
                         scope: "page",
-                        code: "dataset_write_failed",
+                        code: "fetch_failed",
                         message: msg,
                         seedKey,
                         seedIndex: req.seedIndex,
                         pageIndex,
                         url: req.normalizedUrl,
                     });
-                }
-            }
-
-            // Handler-emitted (item + page) warnings.
-            for (const w of handler?.warnings ?? []) {
-                await recordWarning({
-                    scope: w?.scope ?? "item",
-                    code: w?.code ?? "handler_warning",
-                    message: w?.message,
-                    seedKey,
-                    seedIndex: req.seedIndex,
-                    pageIndex,
-                    url: w?.url ?? req.normalizedUrl,
-                });
-            }
-
-            await updateTemplateRunRequestStatus(req.uuid, { status: "completed", finishedAt: new Date() });
-
-            // --- Pagination decision ------------------------------------------
-            // 1) per-seed page cap → warn, stop this seed (no next).
-            if ((pagesBySeed.get(seedKey) ?? 0) >= maxPagesPerSeed) {
-                maxPagesHit = true;
-                coverageComplete = false;
-                await recordWarning({
-                    scope: "seed",
-                    code: "max_pages_reached",
-                    message: `Seed ${seedKey} reached max_pages_per_seed ${maxPagesPerSeed}`,
-                    seedKey,
-                    seedIndex: req.seedIndex,
-                    pageIndex,
-                });
-                continue;
-            }
-            // 2) global item cap reached → stop dispatch (do not enqueue next).
-            if (itemsFound >= maxItems) {
-                maxItemsHit = true;
-                coverageComplete = false;
-                continue;
-            }
-            // 3) empty page → natural end for this seed (no next).
-            if (items.length === 0) {
-                continue;
-            }
-            // 4) follow nextUrl (validated). The uq_template_run_request unique
-            //    index makes an already-visited nextUrl a no-op — this IS the
-            //    visited-URL / pagination-loop dedup.
-            if (nextUrl) {
-                const check = this.normalizeAndValidate(templateConfig, nextUrl);
-                if (!check.ok) {
-                    coverageComplete = false;
-                    await recordWarning({
-                        scope: "page",
-                        code: "next_url_rejected",
-                        message: check.reason,
-                        seedKey,
-                        seedIndex: req.seedIndex,
-                        pageIndex,
-                        url: nextUrl,
+                    await updateTemplateRunRequestStatus(req.uuid, {
+                        status: "failed",
+                        lastError: msg,
+                        finishedAt: new Date(),
                     });
                     continue;
                 }
-                await enqueueTemplateRunRequest({
-                    templateRunUuid: runId,
-                    requestType: "page",
-                    seedKey,
-                    seedIndex: req.seedIndex,
-                    pageIndex: pageIndex + 1,
-                    normalizedUrl: check.url,
-                    requestKey: `page:${seedKey}:${check.url}`,
-                });
+
+                // --- Run the page handler in the trust-branched sandbox ---
+                let handler: any;
+                try {
+                    handler = await this.client.runPageHandler({
+                        templateConfig,
+                        variables: payload.variables ?? {},
+                        requestType: "page",
+                        scrapeResult: {
+                            url: page.url,
+                            rawHtml: page.rawHtml,
+                            html: page.html,
+                            markdown: page.markdown,
+                        },
+                        context: {
+                            runId,
+                            templateRevisionId: payload.templateRevisionId,
+                            seedKey,
+                            pageIndex,
+                            attempt: 1,
+                        },
+                    });
+                } catch (e) {
+                    anyPageFailed = true;
+                    coverageComplete = false;
+                    const msg = e instanceof Error ? e.message : String(e);
+                    await recordWarning({
+                        scope: "page",
+                        code: "page_handler_error",
+                        message: msg,
+                        seedKey,
+                        seedIndex: req.seedIndex,
+                        pageIndex,
+                        url: req.normalizedUrl,
+                    });
+                    await updateTemplateRunRequestStatus(req.uuid, {
+                        status: "failed",
+                        lastError: msg,
+                        finishedAt: new Date(),
+                    });
+                    continue;
+                }
+
+                const items: any[] = Array.isArray(handler?.items) ? handler.items : [];
+                const nextUrl: string | null = handler?.nextUrl ?? null;
+                const detailRequests: any[] = Array.isArray(handler?.detailRequests) ? handler.detailRequests : [];
+                if (detailRequests.length > 0) {
+                    // Phase 1: detail fan-out is intentionally not implemented.
+                    log.info(`[template-run] [${runId}] ignoring ${detailRequests.length} detailRequest(s) (Phase 1)`);
+                }
+
+                pagesFetched++;
+                pagesBySeed.set(seedKey, (pagesBySeed.get(seedKey) ?? 0) + 1);
+
+                // --- Stream items to the Dataset Writer (isolated; never aborts) ---
+                if (items.length > 0) {
+                    itemsFound += items.length;
+                    try {
+                        await writeResultToDataset({
+                            producerType: "template-run",
+                            producerId: runId,
+                            jobId: runId,
+                            scope: { kind: "job", jobId: runId },
+                            scopeType: "orchestrated",
+                            result: { items },
+                            mapping: payload.dataset.mapping as any,
+                            owner: payload.dataset.owner,
+                            dataset: this.datasetTarget(payload),
+                            pageIndex: globalPageCounter++,
+                            finalizeRun: false,
+                        });
+                        itemsReturned += items.length;
+                    } catch (e) {
+                        // Mirror engines/Base.ts: a dataset write failure only warns and
+                        // marks the run partial-at-finalize; it never aborts the page.
+                        anyWriteFailed = true;
+                        coverageComplete = false;
+                        const msg = e instanceof Error ? e.message : String(e);
+                        await recordWarning({
+                            scope: "page",
+                            code: "dataset_write_failed",
+                            message: msg,
+                            seedKey,
+                            seedIndex: req.seedIndex,
+                            pageIndex,
+                            url: req.normalizedUrl,
+                        });
+                    }
+                }
+
+                // Handler-emitted (item + page) warnings.
+                for (const w of handler?.warnings ?? []) {
+                    await recordWarning({
+                        scope: w?.scope ?? "item",
+                        code: w?.code ?? "handler_warning",
+                        message: w?.message,
+                        seedKey,
+                        seedIndex: req.seedIndex,
+                        pageIndex,
+                        url: w?.url ?? req.normalizedUrl,
+                    });
+                }
+
+                await updateTemplateRunRequestStatus(req.uuid, { status: "completed", finishedAt: new Date() });
+
+                // --- Pagination decision ------------------------------------------
+                // 1) per-seed page cap → warn, stop this seed (no next).
+                if ((pagesBySeed.get(seedKey) ?? 0) >= maxPagesPerSeed) {
+                    maxPagesHit = true;
+                    coverageComplete = false;
+                    await recordWarning({
+                        scope: "seed",
+                        code: "max_pages_reached",
+                        message: `Seed ${seedKey} reached max_pages_per_seed ${maxPagesPerSeed}`,
+                        seedKey,
+                        seedIndex: req.seedIndex,
+                        pageIndex,
+                    });
+                    continue;
+                }
+                // 2) global item cap reached → stop dispatch (do not enqueue next).
+                if (itemsFound >= maxItems) {
+                    maxItemsHit = true;
+                    coverageComplete = false;
+                    continue;
+                }
+                // 3) empty page → natural end for this seed (no next).
+                if (items.length === 0) {
+                    continue;
+                }
+                // 4) follow nextUrl (validated). The uq_template_run_request unique
+                //    index makes an already-visited nextUrl a no-op — this IS the
+                //    visited-URL / pagination-loop dedup.
+                if (nextUrl) {
+                    const check = this.normalizeAndValidate(templateConfig, nextUrl);
+                    if (!check.ok) {
+                        coverageComplete = false;
+                        await recordWarning({
+                            scope: "page",
+                            code: "next_url_rejected",
+                            message: check.reason,
+                            seedKey,
+                            seedIndex: req.seedIndex,
+                            pageIndex,
+                            url: nextUrl,
+                        });
+                        continue;
+                    }
+                    await enqueueTemplateRunRequest({
+                        templateRunUuid: runId,
+                        requestType: "page",
+                        seedKey,
+                        seedIndex: req.seedIndex,
+                        pageIndex: pageIndex + 1,
+                        normalizedUrl: check.url,
+                        requestKey: `page:${seedKey}:${check.url}`,
+                    });
+                }
+                // else: no next → natural end for this seed.
             }
-            // else: no next → natural end for this seed.
-        }
+        };
+
+        await Promise.all(
+            Array.from({ length: Math.max(1, maxConcurrency) }, () => workerLoop())
+        );
 
         // --- Finalize ---------------------------------------------------------
         // Natural drain: only finalize once no queued/running requests remain.

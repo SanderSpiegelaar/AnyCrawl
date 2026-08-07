@@ -137,13 +137,28 @@ jest.unstable_mockModule("@anycrawl/db", () => ({
 // Mock: ../managers/Queue.js — the scrape-queue fetch handshake. Path is given
 // relative to the package root (rootDir), matching how OrchestratedRunner's
 // "../managers/Queue.js" resolves.
+//
+// `waitJobDone` tracks concurrently in-flight fetches (inFlightFetches /
+// maxInFlightFetches) and yields a macrotask before resolving. This lets the
+// concurrency regression test below observe that >1 fetch is genuinely
+// in-flight at once under a bounded worker pool — plain correctness
+// assertions alone can't distinguish "true multiplexing" from "serialized,
+// but the response happened to be reused across workers".
 // ---------------------------------------------------------------------------
 let addJobCount = 0;
+let inFlightFetches = 0;
+let maxInFlightFetches = 0;
 jest.unstable_mockModule("./src/managers/Queue.js", () => ({
     QueueManager: {
         getInstance: () => ({
             addJob: async () => `scrape-job-${++addJobCount}`,
-            waitJobDone: async () => ({}),
+            waitJobDone: async () => {
+                inFlightFetches++;
+                maxInFlightFetches = Math.max(maxInFlightFetches, inFlightFetches);
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                inFlightFetches--;
+                return {};
+            },
         }),
     },
 }));
@@ -182,6 +197,8 @@ describe("OrchestratedRunner", () => {
         events = [];
         runStatus = "running";
         addJobCount = 0;
+        inFlightFetches = 0;
+        maxInFlightFetches = 0;
         jobResultData = { rawHtml: "<html></html>", markdown: "# page" };
         validateDomainImpl = () => ({ isValid: true });
         seedHandlerImpl = async () => ({
@@ -302,5 +319,53 @@ describe("OrchestratedRunner", () => {
         // The seed was enqueued but never processed (cancel checked before claim).
         expect(pageHandlerCalls).toBe(0);
         expect(writeCalls).toHaveLength(0);
+    });
+
+    it("drains multiple seeds concurrently when max_concurrency > 1 (bounded worker pool)", async () => {
+        seedHandlerImpl = async () => ({
+            seeds: [
+                { seedKey: "s1", url: "https://sfbay.craigslist.org/search/sss" },
+                { seedKey: "s2", url: "https://nyc.craigslist.org/search/sss" },
+                { seedKey: "s3", url: "https://la.craigslist.org/search/sss" },
+            ],
+        });
+        // Content is intentionally not paired to a specific seed: claim order
+        // across concurrent workers is not deterministic, so which seed gets
+        // which response index can vary. Assertions below use set-comparison
+        // (by item id) rather than exact per-seed sequencing.
+        pageResponses = [
+            { items: [{ id: "a", url: "https://sfbay.craigslist.org/a.html", title: "a" }], nextUrl: null },
+            { items: [{ id: "b", url: "https://nyc.craigslist.org/b.html", title: "b" }], nextUrl: null },
+            { items: [{ id: "c", url: "https://la.craigslist.org/c.html", title: "c" }], nextUrl: null },
+        ];
+
+        await new OrchestratedRunner().run(basePayload({ runOptions: { max_concurrency: 2 } }));
+
+        // All 3 seed pages were dispatched and completed exactly once — none
+        // dropped, none double-claimed — regardless of which worker got which row.
+        expect(ledger).toHaveLength(3);
+        expect(ledger.every((r) => r.status === "completed")).toBe(true);
+        expect(pageHandlerCalls).toBe(3);
+
+        // Proves genuine multiplexing (not just correctness under an
+        // accidentally-serialized mock): at least 2 fetches were in flight
+        // simultaneously, which the old concurrency=1 loop could never produce.
+        expect(maxInFlightFetches).toBeGreaterThanOrEqual(2);
+
+        // Items from every seed landed, order-independent.
+        const allItemIds = writeCalls.flatMap((c) => c.result.items.map((it: any) => it.id)).sort();
+        expect(allItemIds).toEqual(["a", "b", "c"]);
+
+        // Shared accumulators (pagesFetched/itemsFound/itemsReturned) were not
+        // corrupted by concurrent read-modify-write.
+        expect(finalizeCalls).toHaveLength(1);
+        expect(finalizeCalls[0].terminal).toBe("completed");
+        expect(finalizeCalls[0].extras.stopReason).toBe("completed");
+        expect(finalizeCalls[0].extras.statistics).toMatchObject({
+            pages_fetched: 3,
+            items_found: 3,
+            items_returned: 3,
+            coverage_complete: true,
+        });
     });
 });
