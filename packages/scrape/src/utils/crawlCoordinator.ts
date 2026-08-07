@@ -2,7 +2,7 @@ import { extractUrlsFromCheerio } from "crawlee";
 import { log } from "@anycrawl/libs";
 import { QueueManager } from "../managers/Queue.js";
 import { resolveAutoEngine } from "./autoEngine.js";
-import { completedJob, failedJob } from "@anycrawl/db";
+import { completedJob, failedJob, finalizeCrawlDatasetRun } from "@anycrawl/db";
 import { minimatch } from "minimatch";
 import * as cheerio from "cheerio";
 
@@ -123,6 +123,7 @@ export async function runAutoCrawl(
             completed,
             failed,
         });
+        await finalizeCrawlDataset(jobId, payload);
     } catch (err) {
         const msg =
             err instanceof Error ? err.message : "Crawl coordinator failed";
@@ -132,6 +133,33 @@ export async function runAutoCrawl(
             completed,
             failed,
         });
+        await finalizeCrawlDataset(jobId, payload);
+    }
+}
+
+/**
+ * Dataset output (additive): finalize the crawl's accumulating dataset run at the
+ * auto-crawl coordinator's terminal point (this path finalizes via completedJob/
+ * failedJob and never reaches ProgressManager.tryFinalize). Per-page writes used
+ * finalizeRun:false, so the run is still `running` with unsequenced members; move
+ * it to completed/partial and assign the contiguous sequence. Guarded on the crawl
+ * carrying an output.dataset binding — a no-op for non-dataset crawls. Best-effort:
+ * a finalize failure never changes the coordinator's own job outcome.
+ */
+async function finalizeCrawlDataset(jobId: string, payload: any): Promise<void> {
+    try {
+        const datasetId: string | undefined = payload?.options?.dataset?.datasetId;
+        if (datasetId) {
+            await finalizeCrawlDatasetRun({
+                datasetId,
+                producerType: "crawl",
+                producerId: jobId,
+            });
+        }
+    } catch (err) {
+        log.warning(
+            `[CrawlCoordinator] ${jobId} dataset finalize failed: ${err instanceof Error ? err.message : String(err)}`
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 import IORedis from "ioredis";
 import { Utils } from "../Utils.js";
-import { completedJob, failedJob, getDB, getJob, schemas, eq, sql, Billing } from "@anycrawl/db";
+import { completedJob, failedJob, getDB, getJob, schemas, eq, sql, Billing, finalizeCrawlDatasetRun } from "@anycrawl/db";
 import { log, CreditCalculator, WebhookEventType, appConfig, config } from "@anycrawl/libs";
 import type { QueueName } from "./Queue.js";
 import { BandwidthManager } from "./Bandwidth.js";
@@ -393,6 +393,29 @@ export class ProgressManager {
                 }
             } catch (error) {
                 log.warning(`[PROGRESS] Failed to update job status in DB for job ${jobId}: ${error}`);
+            }
+
+            // Dataset output (additive): finalize the crawl's accumulating dataset
+            // run HERE, at the crawl's single terminal point. Per-page writes used
+            // finalizeRun:false, so the run is still `running` with unsequenced
+            // members; move it to completed/partial and assign the contiguous 1..N
+            // sequence. Guarded on the crawl carrying an output.dataset binding —
+            // a strict no-op for non-dataset crawls. Never allowed to break crawl
+            // finalization; errors are swallowed here.
+            try {
+                const datasetBinding = (job?.data?.options as any)?.dataset;
+                const datasetId: string | undefined = datasetBinding?.datasetId;
+                if (datasetId) {
+                    await finalizeCrawlDatasetRun({
+                        datasetId,
+                        producerType: "crawl",
+                        producerId: jobId,
+                    });
+                }
+            } catch (error) {
+                log.warning(
+                    `[${queueName}] [${jobId}] Failed to finalize dataset run: ${error instanceof Error ? error.message : String(error)}`
+                );
             }
 
             // Finalize the scheduled task execution (if this crawl belongs to one)

@@ -141,6 +141,7 @@ export const listRunWarnings = Dataset.listRunWarnings;
 // Dataset Writer (producer write-path service). Additive: only invoked when a
 // request carries `output.dataset` — the no-dataset path is untouched.
 export const writeResultToDataset = DatasetWriter.writeResultToDataset.bind(DatasetWriter);
+export const finalizeCrawlDatasetRun = DatasetWriter.finalizeCrawlDatasetRun.bind(DatasetWriter);
 export const assertDatasetWritable = DatasetWriter.assertDatasetWritable.bind(DatasetWriter);
 export const parseDatasetOutput = DatasetWriter.parseOutput.bind(DatasetWriter);
 export const standardDatasetMapping = DatasetWriter.standardMapping.bind(DatasetWriter);

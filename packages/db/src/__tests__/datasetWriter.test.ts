@@ -434,3 +434,345 @@ describe("DatasetWriter run membership (dataset_run_items)", () => {
         expect(afterReplay.every((r) => r.sequence === null)).toBe(true);
     });
 });
+
+describe("DatasetWriter projections (dataset_item_field_values)", () => {
+    // Custom mapping keyed by /id so the same item_key can be re-written across jobs.
+    const PROJ_MAPPING = {
+        name: "anycrawl_scrape",
+        version: "1.0.0",
+        projections: [
+            { name: "price", path: "/price/amount", type: "number" },
+            { name: "in_stock", path: "/inStock", type: "boolean" },
+            { name: "brand", path: "/brand", type: "string" },
+            { name: "published_at", path: "/publishedAt", type: "timestamptz" },
+        ],
+    };
+
+    /** All field-value rows for an item_key, keyed by field_name. */
+    const fieldRowsOf = (datasetId: string, itemKey: string): Record<string, any> => {
+        const rows = sqlite
+            .prepare(
+                `SELECT field_name, field_type, string_value, number_value, boolean_value, timestamptz_value
+                 FROM dataset_item_field_values WHERE dataset_id = ? AND item_key = ?`
+            )
+            .all(datasetId, itemKey) as any[];
+        return Object.fromEntries(rows.map((r) => [r.field_name, r]));
+    };
+
+    const fieldCount = (datasetId: string): number =>
+        (sqlite
+            .prepare(`SELECT COUNT(*) AS c FROM dataset_item_field_values WHERE dataset_id = ?`)
+            .get(datasetId) as any).c;
+
+    const PUBLISHED = "2026-01-02T03:04:05.000Z";
+    const URL_P = "https://proj.test/p1";
+
+    let datasetId: string;
+
+    it("populates typed columns for each resolvable projection, one column per row", async () => {
+        const out = await writeScrape({
+            jobId: "proj-1",
+            mapping: PROJ_MAPPING,
+            result: scrapeDoc(URL_P, {
+                price: { amount: 19.95 },
+                inStock: true,
+                brand: "Acme",
+                publishedAt: PUBLISHED,
+            }),
+            dataset: { create: { name: "Projections DS" } },
+        });
+        datasetId = out.datasetId;
+        expect(out.itemsCreated).toBe(1);
+
+        const rows = fieldRowsOf(datasetId, URL_P);
+        expect(Object.keys(rows).sort()).toEqual(["brand", "in_stock", "price", "published_at"]);
+
+        // number → number_value only.
+        expect(rows.price.field_type).toBe("number");
+        expect(rows.price.number_value).toBe(19.95);
+        expect(rows.price.string_value).toBeNull();
+        expect(rows.price.boolean_value).toBeNull();
+        expect(rows.price.timestamptz_value).toBeNull();
+
+        // boolean → boolean_value only (stored as 1 in SQLite).
+        expect(rows.in_stock.field_type).toBe("boolean");
+        expect(rows.in_stock.boolean_value).toBe(1);
+        expect(rows.in_stock.string_value).toBeNull();
+        expect(rows.in_stock.number_value).toBeNull();
+        expect(rows.in_stock.timestamptz_value).toBeNull();
+
+        // string → string_value only.
+        expect(rows.brand.field_type).toBe("string");
+        expect(rows.brand.string_value).toBe("Acme");
+        expect(rows.brand.number_value).toBeNull();
+        expect(rows.brand.boolean_value).toBeNull();
+        expect(rows.brand.timestamptz_value).toBeNull();
+
+        // timestamptz → timestamptz_value only (non-null; other typed columns null).
+        expect(rows.published_at.field_type).toBe("timestamptz");
+        expect(rows.published_at.timestamptz_value).not.toBeNull();
+        expect(rows.published_at.string_value).toBeNull();
+        expect(rows.published_at.number_value).toBeNull();
+        expect(rows.published_at.boolean_value).toBeNull();
+
+        expect(fieldCount(datasetId)).toBe(4);
+    });
+
+    it("writes no row for a projection whose path resolves to missing/null", async () => {
+        const out = await writeScrape({
+            jobId: "proj-missing",
+            mapping: PROJ_MAPPING,
+            result: scrapeDoc("https://proj.test/missing", {
+                price: { amount: 5 },
+                // inStock, brand, publishedAt all absent.
+            }),
+            dataset: { datasetId },
+        });
+        expect(out.itemsCreated).toBe(1);
+
+        const rows = fieldRowsOf(datasetId, "https://proj.test/missing");
+        // Only the resolvable projection produced a row.
+        expect(Object.keys(rows)).toEqual(["price"]);
+        expect(rows.price.number_value).toBe(5);
+    });
+
+    it("upserts on the update path: one row per field, values refreshed, no duplicates", async () => {
+        const before = fieldRowsOf(datasetId, URL_P);
+        // Change a projected field (price) via a different job → item is 'updated'.
+        const out = await writeScrape({
+            jobId: "proj-2",
+            mapping: PROJ_MAPPING,
+            result: scrapeDoc(URL_P, {
+                price: { amount: 29.5 },
+                inStock: false,
+                brand: "Acme",
+                publishedAt: PUBLISHED,
+            }),
+            dataset: { datasetId },
+        });
+        expect(out.itemsUpdated).toBe(1);
+
+        const after = fieldRowsOf(datasetId, URL_P);
+        // Still exactly four rows for this item (upsert, not insert).
+        expect(Object.keys(after).sort()).toEqual(["brand", "in_stock", "price", "published_at"]);
+        // Same physical rows were updated in place, refreshed values.
+        expect(after.price.number_value).toBe(29.5);
+        expect(after.in_stock.boolean_value).toBe(0); // false now
+        // No new rows created overall for this item beyond the original four.
+        expect(Object.keys(after)).toHaveLength(Object.keys(before).length);
+    });
+
+    it("is idempotent on replay: replaying the same job leaves field_values unchanged", async () => {
+        const countBefore = fieldCount(datasetId);
+        const rowsBefore = fieldRowsOf(datasetId, URL_P);
+
+        await writeScrape({
+            jobId: "proj-2", // same producer message as the update above
+            mapping: PROJ_MAPPING,
+            result: scrapeDoc(URL_P, {
+                price: { amount: 29.5 },
+                inStock: false,
+                brand: "Acme",
+                publishedAt: PUBLISHED,
+            }),
+            dataset: { datasetId },
+        });
+
+        expect(fieldCount(datasetId)).toBe(countBefore);
+        const rowsAfter = fieldRowsOf(datasetId, URL_P);
+        expect(rowsAfter.price.number_value).toBe(rowsBefore.price.number_value);
+        expect(rowsAfter.in_stock.boolean_value).toBe(rowsBefore.in_stock.boolean_value);
+    });
+
+    it("writes no field_values when the mapping declares no projections", async () => {
+        const out = await writeScrape({
+            jobId: "no-proj-1",
+            mapping: SCRAPE_MAPPING, // no projections
+            result: scrapeDoc("https://noproj.test/a", { price: { amount: 1 } }),
+            dataset: { create: { name: "No Projections DS" } },
+        });
+        expect(out.itemsCreated).toBe(1);
+        expect(fieldCount(out.datasetId)).toBe(0);
+    });
+
+    it("resolves RFC 6901 escaped tokens (~1 -> '/', ~0 -> '~') in projection paths", async () => {
+        const out = await writeScrape({
+            jobId: "proj-esc",
+            mapping: {
+                name: "anycrawl_scrape",
+                version: "1.0.0",
+                projections: [
+                    { name: "slash_field", path: "/a~1b", type: "string" },
+                    { name: "tilde_field", path: "/c~0d", type: "string" },
+                ],
+            },
+            result: scrapeDoc("https://proj.test/escapes", {
+                "a/b": "slash-value",
+                "c~d": "tilde-value",
+            }),
+            dataset: { create: { name: "Escape DS" } },
+        });
+        expect(out.itemsCreated).toBe(1);
+
+        const rows = fieldRowsOf(out.datasetId, "https://proj.test/escapes");
+        expect(rows.slash_field.string_value).toBe("slash-value");
+        expect(rows.tilde_field.string_value).toBe("tilde-value");
+    });
+});
+
+describe("DatasetWriter.finalizeCrawlDatasetRun (crawl finalize)", () => {
+    const runStatusOf = (runId: string): any =>
+        sqlite
+            .prepare(`SELECT status, warning_count, finished_at FROM dataset_runs WHERE uuid = ?`)
+            .get(runId) as any;
+
+    /** Write N crawl pages (finalizeRun:false) into a fresh dataset; return ids. */
+    async function crawlPages(
+        crawlJob: string,
+        urls: string[]
+    ): Promise<{ datasetId: string; runId: string }> {
+        const first = await writeRun({
+            jobId: crawlJob,
+            producerId: crawlJob,
+            scopeType: "crawl",
+            producerType: "crawl",
+            mapping: CRAWL_MAPPING,
+            result: scrapeDoc(urls[0] as string),
+            dataset: { create: { name: `Crawl Finalize ${crawlJob}` } },
+            finalizeRun: false,
+            pageIndex: 0,
+        });
+        const datasetId = first.datasetId;
+        for (let i = 1; i < urls.length; i++) {
+            await writeRun({
+                jobId: crawlJob,
+                producerId: crawlJob,
+                scopeType: "crawl",
+                producerType: "crawl",
+                mapping: CRAWL_MAPPING,
+                result: scrapeDoc(urls[i] as string),
+                dataset: { datasetId },
+                finalizeRun: false,
+                pageIndex: i,
+            });
+        }
+        return { datasetId, runId: runIdOf(datasetId, "crawl", crawlJob) };
+    }
+
+    it("moves a running crawl run to completed and assigns a contiguous sequence", async () => {
+        const crawlJob = "cf-1";
+        const { datasetId, runId } = await crawlPages(crawlJob, [
+            "https://cf.test/1",
+            "https://cf.test/2",
+            "https://cf.test/3",
+        ]);
+
+        // Before finalize: run is 'running' and members are unsequenced.
+        expect(runStatusOf(runId).status).toBe("running");
+        expect(runItemsOf(runId).every((r) => r.sequence === null)).toBe(true);
+
+        const out = await DatasetWriter.finalizeCrawlDatasetRun({
+            datasetId,
+            producerType: "crawl",
+            producerId: crawlJob,
+            dbOrTx: db,
+        });
+
+        expect(out.finalized).toBe(true);
+        expect(out.status).toBe("completed");
+        expect(out.datasetRunId).toBe(runId);
+
+        const after = runStatusOf(runId);
+        expect(after.status).toBe("completed");
+        expect(after.finished_at).not.toBeNull();
+
+        const items = runItemsOf(runId);
+        expect(items.map((r) => r.sequence)).toEqual([1, 2, 3]);
+        // Sequence follows page order.
+        expect(items.map((r) => r.item_key)).toEqual([
+            "https://cf.test/1",
+            "https://cf.test/2",
+            "https://cf.test/3",
+        ]);
+    });
+
+    it("is idempotent: re-finalizing is a no-op and preserves the sequence", async () => {
+        const crawlJob = "cf-2";
+        const { datasetId, runId } = await crawlPages(crawlJob, [
+            "https://cf2.test/1",
+            "https://cf2.test/2",
+        ]);
+
+        const first = await DatasetWriter.finalizeCrawlDatasetRun({
+            datasetId,
+            producerId: crawlJob,
+            dbOrTx: db,
+        });
+        expect(first.finalized).toBe(true);
+        const seqAfterFirst = runItemsOf(runId).map((r) => r.sequence);
+        const finishedAfterFirst = runStatusOf(runId).finished_at;
+
+        const second = await DatasetWriter.finalizeCrawlDatasetRun({
+            datasetId,
+            producerId: crawlJob,
+            dbOrTx: db,
+        });
+        // Second call reports the run was already terminal; nothing re-numbered.
+        expect(second.finalized).toBe(false);
+        expect(second.status).toBe("completed");
+        expect(runItemsOf(runId).map((r) => r.sequence)).toEqual(seqAfterFirst);
+        expect(runStatusOf(runId).status).toBe("completed");
+        expect(runStatusOf(runId).finished_at).toEqual(finishedAfterFirst);
+    });
+
+    it("finalizes to partial when the run accumulated warnings across pages", async () => {
+        const crawlJob = "cf-3";
+        // Page 1: a valid page → one member.
+        const first = await writeRun({
+            jobId: crawlJob,
+            producerId: crawlJob,
+            scopeType: "crawl",
+            producerType: "crawl",
+            mapping: CRAWL_MAPPING,
+            result: scrapeDoc("https://cf3.test/ok"),
+            dataset: { create: { name: "Crawl Partial DS" } },
+            finalizeRun: false,
+            pageIndex: 0,
+        });
+        const datasetId = first.datasetId;
+        // Page 2: a crawl page with no URL → missing_item_key warning, no member.
+        await writeRun({
+            jobId: crawlJob,
+            producerId: crawlJob,
+            scopeType: "crawl",
+            producerType: "crawl",
+            mapping: CRAWL_MAPPING,
+            result: { title: "no url here" },
+            dataset: { datasetId },
+            finalizeRun: false,
+            pageIndex: 1,
+        });
+
+        const runId = runIdOf(datasetId, "crawl", crawlJob);
+        expect(runStatusOf(runId).warning_count).toBeGreaterThan(0);
+
+        const out = await DatasetWriter.finalizeCrawlDatasetRun({
+            datasetId,
+            producerId: crawlJob,
+            dbOrTx: db,
+        });
+        expect(out.status).toBe("partial");
+        expect(runStatusOf(runId).status).toBe("partial");
+        // The single valid page is sequenced.
+        expect(runItemsOf(runId).map((r) => r.sequence)).toEqual([1]);
+    });
+
+    it("is a no-op when no matching dataset run exists (non-dataset crawl)", async () => {
+        const out = await DatasetWriter.finalizeCrawlDatasetRun({
+            datasetId: "00000000-0000-0000-0000-000000000000",
+            producerId: "no-such-crawl-job",
+            dbOrTx: db,
+        });
+        expect(out).toEqual({ finalized: false, datasetRunId: null, status: null });
+    });
+});

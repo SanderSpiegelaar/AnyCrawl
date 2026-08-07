@@ -406,6 +406,90 @@ export class DatasetWriter {
         });
     }
 
+    /**
+     * Finalize a crawl's accumulating dataset run at the crawl's terminal state.
+     *
+     * Crawl per-page writes use `finalizeRun:false`, so the run stays `running` and
+     * its members keep `sequence` NULL while pages arrive (see writeResultToDataset
+     * step 6). This is that crawl-finalize hook: called from the crawl's real
+     * terminal point (ProgressManager.tryFinalize's winner branch and the auto-crawl
+     * coordinator), it moves the run to a terminal status and assigns the contiguous
+     * 1..N sequence across the run's members.
+     *
+     * The run is identified by (dataset_id, producer_type, producer_id) — the same
+     * key getOrCreateRun used for every page. It is a safe no-op when:
+     *   - no such run exists (a non-dataset crawl, or a crawl where no page ever
+     *     wrote), or
+     *   - the run is already terminal (idempotent on retry / double-finalize) —
+     *     in which case it only re-asserts the sequence assignment (itself idempotent).
+     *
+     * Status mirrors the one-shot finalize: `partial` when any warnings were recorded
+     * across the run's pages, otherwise `completed`. Per-item counters
+     * (item_count/active_item_count) are maintained by the per-page writes, so there
+     * is nothing to update here. Runs inside the caller's tx when supplied, else a
+     * new transaction.
+     */
+    static async finalizeCrawlDatasetRun(params: {
+        datasetId: string;
+        producerId: string;
+        producerType?: string;
+        now?: Date;
+        dbOrTx?: DBExecutor;
+    }): Promise<{
+        finalized: boolean;
+        datasetRunId: string | null;
+        status: DatasetRunStatus | null;
+    }> {
+        const now = params.now ?? new Date();
+        const producerType = params.producerType ?? "crawl";
+
+        return this.runInTransaction(params.dbOrTx, async (tx) => {
+            const [run] = await tx
+                .select()
+                .from(schemas.datasetRuns)
+                .where(
+                    and(
+                        eq(schemas.datasetRuns.datasetId, params.datasetId),
+                        eq(schemas.datasetRuns.producerType, producerType),
+                        eq(schemas.datasetRuns.producerId, params.producerId)
+                    )
+                )
+                .limit(1);
+
+            if (!run) {
+                return { finalized: false, datasetRunId: null, status: null };
+            }
+
+            // Already terminal — idempotent no-op. Still re-assert the sequence
+            // assignment so a finalize that crashed after the status update but
+            // before sequencing converges on a later call.
+            if (run.status !== "running") {
+                await this.assignRunItemSequences(tx, run.uuid);
+                return {
+                    finalized: false,
+                    datasetRunId: run.uuid,
+                    status: run.status as DatasetRunStatus,
+                };
+            }
+
+            const warningCount = Number(run.warningCount ?? 0);
+            const status: DatasetRunStatus = warningCount > 0 ? "partial" : "completed";
+
+            await tx
+                .update(schemas.datasetRuns)
+                .set({
+                    status,
+                    finishedAt: run.finishedAt ?? now,
+                    updatedAt: now,
+                })
+                .where(eq(schemas.datasetRuns.uuid, run.uuid));
+
+            await this.assignRunItemSequences(tx, run.uuid);
+
+            return { finalized: true, datasetRunId: run.uuid, status };
+        });
+    }
+
     // --- Step 1: dataset resolution -----------------------------------------
 
     private static async resolveDataset(
@@ -1038,12 +1122,17 @@ export class DatasetWriter {
         return [];
     }
 
-    /** Resolve a JSON-pointer-ish path ("/a/b" or "a") against a value. */
+    /**
+     * Resolve an RFC 6901 JSON pointer ("/a/b" or the shorthand "a") against a
+     * value. Reference tokens are unescaped per RFC 6901 (`~1` -> `/`, `~0` -> `~`,
+     * in that order) so field names that contain `/` or `~` resolve correctly.
+     */
     private static getPath(source: unknown, path: string): unknown {
         const segments = String(path)
             .split("/")
             .map((s) => s.trim())
-            .filter((s) => s.length > 0);
+            .filter((s) => s.length > 0)
+            .map((s) => s.replace(/~1/g, "/").replace(/~0/g, "~"));
         let node: any = source;
         for (const seg of segments) {
             if (node === null || typeof node !== "object") return undefined;
