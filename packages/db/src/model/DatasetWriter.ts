@@ -3,6 +3,7 @@ import { log } from "@anycrawl/libs/log";
 import type { OwnerContext } from "@anycrawl/libs";
 import { getDB, schemas } from "../db/index.js";
 import { getOwnedDataset } from "./DatasetAccess.js";
+import { Dataset } from "./Dataset.js";
 import { computeDocumentHash, shallowFieldDiff } from "./documentHash.js";
 
 type DBExecutor = any;
@@ -47,7 +48,11 @@ export interface DatasetMapping {
     itemKeyPath?: string;
     /** Extra document paths to strip before hashing. */
     hashExcludePaths?: string[];
-    /** Optional typed projections written to dataset_item_field_values. */
+    /**
+     * Optional queryable-field catalog. Snapshotted onto `datasets.query_fields` at
+     * create (not stored per-item); read at query time to validate + resolve each
+     * filter/sort field's document path + type for the jsonb-direct query layer.
+     */
     projections?: DatasetProjectionSpec[];
 }
 
@@ -505,22 +510,55 @@ export class DatasetWriter {
         }
 
         const spec = params.dataset.create;
-        const [row] = await tx
-            .insert(schemas.datasets)
-            .values({
-                apiKey: params.owner.apiKeyId ?? null,
-                userId: params.owner.userId ?? null,
-                name: spec.name,
-                description: spec.description ?? null,
-                sourceType: params.scopeType,
-                schemaName: params.mapping.name,
-                schemaVersion: params.mapping.version,
-                retentionPolicy: spec.retentionPolicy ?? null,
-                createdAt: now,
-                updatedAt: now,
-            })
-            .returning();
-        return row;
+
+        // Ensure-by-name: reuse an existing non-deleted dataset owned by this caller
+        // with the same name so repeated runs accumulate into ONE dataset (items
+        // dedup + change-tracking continue against it). Only when the caller is
+        // owner-scoped; unscoped writers always create.
+        const existing = await Dataset.getByOwnerAndName(tx, params.owner, spec.name);
+        if (existing) {
+            this.assertSchemaCompatible(existing, params.mapping);
+            return existing;
+        }
+
+        const values = {
+            apiKey: params.owner.apiKeyId ?? null,
+            userId: params.owner.userId ?? null,
+            name: spec.name,
+            description: spec.description ?? null,
+            sourceType: params.scopeType,
+            schemaName: params.mapping.name,
+            schemaVersion: params.mapping.version,
+            // Snapshot the queryable-field catalog for jsonb-direct filter/sort.
+            queryFields: this.buildQueryFields(params.mapping),
+            retentionPolicy: spec.retentionPolicy ?? null,
+            createdAt: now,
+            updatedAt: now,
+        };
+
+        try {
+            const [row] = await tx.insert(schemas.datasets).values(values).returning();
+            return row;
+        } catch (error) {
+            // Create race: another writer inserted the same owner+name concurrently.
+            // There is no hard unique constraint (by design), but re-select defensively
+            // so a duplicate-key error from any future constraint converges on reuse.
+            const raced = await Dataset.getByOwnerAndName(tx, params.owner, spec.name);
+            if (raced) {
+                this.assertSchemaCompatible(raced, params.mapping);
+                return raced;
+            }
+            throw error;
+        }
+    }
+
+    /** Map the producer mapping's projections into the dataset query_fields catalog. */
+    private static buildQueryFields(
+        mapping: DatasetMapping
+    ): Array<{ field: string; path: string; type: DatasetProjectionSpec["type"] }> | null {
+        const projections = mapping.projections;
+        if (!projections || projections.length === 0) return null;
+        return projections.map((p) => ({ field: p.name, path: p.path, type: p.type }));
     }
 
     // --- Step 2: run get-or-create ------------------------------------------
@@ -725,7 +763,6 @@ export class DatasetWriter {
                     fieldChanges: null,
                     now,
                 });
-                await this.writeProjections(tx, dataset.uuid, candidate, params, now);
                 return {
                     classification: changeInserted ? "created" : "replayed",
                     itemUuid: insertedItem.uuid,
@@ -800,7 +837,6 @@ export class DatasetWriter {
             fieldChanges: Object.keys(fieldChanges).length > 0 ? fieldChanges : null,
             now,
         });
-        await this.writeProjections(tx, dataset.uuid, candidate, params, now);
         return {
             classification: changeInserted ? "updated" : "replayed",
             itemUuid: existing.uuid,
@@ -945,79 +981,6 @@ export class DatasetWriter {
                 .set({ sequence: seq })
                 .where(eq(schemas.datasetRunItems.uuid, r.uuid));
             seq++;
-        }
-    }
-
-    // --- Optional projections (dataset_item_field_values) -------------------
-
-    private static async writeProjections(
-        tx: DBExecutor,
-        datasetId: string,
-        candidate: ItemCandidate,
-        params: WriteResultToDatasetParams,
-        now: Date
-    ): Promise<void> {
-        const projections = params.mapping.projections;
-        if (!projections || projections.length === 0) return;
-
-        for (const proj of projections) {
-            const raw = this.getPath(candidate.document, proj.path);
-            const typed = this.coerceProjection(proj.type, raw);
-            if (typed === undefined) continue; // unresolvable / wrong type → skip silently
-
-            await tx
-                .insert(schemas.datasetItemFieldValues)
-                .values({
-                    datasetId,
-                    itemKey: candidate.itemKey,
-                    fieldName: proj.name,
-                    fieldType: proj.type,
-                    stringValue: proj.type === "string" ? (typed as string) : null,
-                    numberValue: proj.type === "number" ? (typed as any) : null,
-                    booleanValue: proj.type === "boolean" ? (typed as boolean) : null,
-                    timestamptzValue: proj.type === "timestamptz" ? (typed as Date) : null,
-                    createdAt: now,
-                    updatedAt: now,
-                })
-                .onConflictDoUpdate({
-                    target: [
-                        schemas.datasetItemFieldValues.datasetId,
-                        schemas.datasetItemFieldValues.itemKey,
-                        schemas.datasetItemFieldValues.fieldName,
-                    ],
-                    set: {
-                        fieldType: proj.type,
-                        stringValue: proj.type === "string" ? (typed as string) : null,
-                        numberValue: proj.type === "number" ? (typed as any) : null,
-                        booleanValue: proj.type === "boolean" ? (typed as boolean) : null,
-                        timestamptzValue: proj.type === "timestamptz" ? (typed as Date) : null,
-                        updatedAt: now,
-                    },
-                });
-        }
-    }
-
-    private static coerceProjection(
-        type: DatasetProjectionSpec["type"],
-        raw: unknown
-    ): string | number | boolean | Date | undefined {
-        if (raw === null || raw === undefined) return undefined;
-        switch (type) {
-            case "string":
-                return typeof raw === "object" ? undefined : String(raw);
-            case "number": {
-                const n = Number(raw);
-                return Number.isFinite(n) ? n : undefined;
-            }
-            case "boolean":
-                if (typeof raw === "boolean") return raw;
-                if (raw === "true" || raw === 1) return true;
-                if (raw === "false" || raw === 0) return false;
-                return undefined;
-            case "timestamptz": {
-                const d = raw instanceof Date ? raw : new Date(String(raw));
-                return Number.isNaN(d.getTime()) ? undefined : d;
-            }
         }
     }
 

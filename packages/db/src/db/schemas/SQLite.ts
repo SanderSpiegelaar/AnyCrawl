@@ -497,6 +497,8 @@ export const monitorChanges = p.sqliteTable("monitor_changes", {
 // Dataset (L2) tables — SQLite parallel of platform §11 / dedicated §5.9.
 // Type substitutions: uuid->text, jsonb->text{json}, timestamp->integer{timestamp},
 // boolean->integer{boolean}, numeric->real. Same table/column/index names as PostgreSQL.
+// Filter/sort query dataset_items.document via json_extract (no GIN); the
+// queryable-field catalog is snapshotted onto datasets.query_fields at create.
 // ============================================================================
 
 export const datasets = p.sqliteTable("datasets", {
@@ -510,6 +512,12 @@ export const datasets = p.sqliteTable("datasets", {
     sourceTemplateRevisionUuid: p.text("source_template_revision_uuid"),          // [RESERVED per R2]
     schemaName: p.text("schema_name").notNull(),
     schemaVersion: p.text("schema_version").notNull(),
+    // Frozen queryable-field catalog for json_extract filter/sort (SQLite parallel
+    // of the PG query_fields column). Snapshotted at create from the producer
+    // mapping's projections: [{ field, path (RFC 6901), type }].
+    queryFields: p
+        .text("query_fields", { mode: "json" })
+        .$type<Array<{ field: string; path: string; type: "string" | "number" | "boolean" | "timestamptz" }>>(),
     retentionPolicy: p.text("retention_policy", { mode: "json" }).$type<{ item_days?: number; change_days?: number }>(),
     itemCount: p.integer("item_count").notNull().default(0),
     activeItemCount: p.integer("active_item_count").notNull().default(0),
@@ -519,6 +527,10 @@ export const datasets = p.sqliteTable("datasets", {
 }, (t) => [
     p.index("ix_datasets_user_created").on(t.userId, t.createdAt, t.uuid).where(sql`${t.deletedAt} IS NULL`),
     p.index("ix_datasets_apikey_created").on(t.apiKey, t.createdAt, t.uuid).where(sql`${t.deletedAt} IS NULL`),
+    // Ensure-by-name lookup indexes (owner + name, non-deleted). Non-unique on
+    // purpose (see PostgreSQL note).
+    p.index("ix_datasets_user_name").on(t.userId, t.name).where(sql`${t.deletedAt} IS NULL`),
+    p.index("ix_datasets_apikey_name").on(t.apiKey, t.name).where(sql`${t.deletedAt} IS NULL`),
 ]);
 
 export const datasetRuns = p.sqliteTable("dataset_runs", {
@@ -621,32 +633,6 @@ export const datasetItemChanges = p.sqliteTable("dataset_item_changes", {
     p.index("ix_dataset_change_run_cursor").on(t.datasetRunId, t.createdAt, t.uuid),
     p.index("ix_dataset_change_dataset_cursor").on(t.datasetId, t.createdAt, t.uuid),
     p.index("ix_dataset_change_item").on(t.datasetItemId),
-]);
-
-export const datasetItemFieldValues = p.sqliteTable("dataset_item_field_values", {
-    uuid: p.text("uuid").primaryKey().$defaultFn(() => randomUUID()),
-    datasetId: p.text("dataset_id").notNull().references(() => datasets.uuid, { onDelete: "cascade" }),
-    itemKey: p.text("item_key").notNull(),
-    fieldName: p.text("field_name").notNull(),
-    fieldType: p.text("field_type").notNull(),
-    stringValue: p.text("string_value"),
-    numberValue: p.real("number_value"),
-    booleanValue: p.integer("boolean_value", { mode: "boolean" }),
-    timestamptzValue: p.integer("timestamptz_value", { mode: "timestamp" }),
-    createdAt: p.integer("created_at", { mode: "timestamp" }).notNull(),
-    updatedAt: p.integer("updated_at", { mode: "timestamp" }).notNull(),
-}, (t) => [
-    p.uniqueIndex("uq_dataset_item_field").on(t.datasetId, t.itemKey, t.fieldName),
-    p.check("dataset_item_field_values_typed_value_chk", sql`
-        (${t.fieldType} = 'string'      AND ${t.stringValue}      IS NOT NULL AND ${t.numberValue} IS NULL AND ${t.booleanValue} IS NULL AND ${t.timestamptzValue} IS NULL)
-     OR (${t.fieldType} = 'number'      AND ${t.numberValue}      IS NOT NULL AND ${t.stringValue} IS NULL AND ${t.booleanValue} IS NULL AND ${t.timestamptzValue} IS NULL)
-     OR (${t.fieldType} = 'boolean'     AND ${t.booleanValue}     IS NOT NULL AND ${t.stringValue} IS NULL AND ${t.numberValue} IS NULL AND ${t.timestamptzValue} IS NULL)
-     OR (${t.fieldType} = 'timestamptz' AND ${t.timestamptzValue} IS NOT NULL AND ${t.stringValue} IS NULL AND ${t.numberValue} IS NULL AND ${t.booleanValue} IS NULL)
-    `),
-    p.index("ix_dsfv_string").on(t.datasetId, t.fieldName, t.stringValue),
-    p.index("ix_dsfv_number").on(t.datasetId, t.fieldName, t.numberValue),
-    p.index("ix_dsfv_boolean").on(t.datasetId, t.fieldName, t.booleanValue),
-    p.index("ix_dsfv_timestamptz").on(t.datasetId, t.fieldName, t.timestamptzValue),
 ]);
 
 export const runWarnings = p.sqliteTable("run_warnings", {

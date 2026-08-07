@@ -130,7 +130,10 @@ export const createDataset = Dataset.create;
 export const updateDataset = Dataset.update;
 export const softDeleteDataset = Dataset.softDelete;
 export const listDatasetsByOwner = Dataset.listByOwner;
-export const getDatasetProjectionFields = Dataset.getProjectionFields;
+// Returns the queryable-field catalog Map<field, { path, type }> read from
+// datasets.query_fields (used by the controller to validate + resolve filter/sort).
+export const getDatasetProjectionFields = Dataset.getProjectionCatalog;
+export const getDatasetByOwnerAndName = Dataset.getByOwnerAndName;
 export const getDatasetItems = Dataset.getItems;
 export const listDatasetRuns = Dataset.listRuns;
 export const getDatasetRun = Dataset.getRun;
@@ -199,7 +202,6 @@ export {
     datasetRunItems,
     datasetItemScopes,
     datasetItemChanges,
-    datasetItemFieldValues,
     runWarnings,
 } from "./db/schemas/PostgreSQL.js";
 
@@ -229,6 +231,7 @@ export type {
     ItemSort as DatasetItemSort,
     CursorKey as DatasetCursorKey,
     PageResult as DatasetPageResult,
+    ProjectionCatalogEntry as DatasetProjectionCatalogEntry,
 } from "./model/Dataset.js";
 
 // Slug write-path validation (design doc §5.7). Exported so API callers can map

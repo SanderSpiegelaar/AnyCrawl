@@ -169,6 +169,13 @@
       "when": 1786011915664,
       "tag": "0023_template_runtime_output_schema",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1786082562506,
+      "tag": "0024_dataset_jsonb_query",
+      "breakpoints": true
     }
   ]
 }

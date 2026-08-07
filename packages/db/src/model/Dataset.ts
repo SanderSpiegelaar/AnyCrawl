@@ -16,6 +16,8 @@ export type FilterOp = "eq" | "in" | "lt" | "lte" | "gt" | "gte";
 export interface ItemFilter {
     field: string;
     fieldType: FieldType;
+    /** RFC 6901 JSON pointer into the document ("/price/amount" or "price"). */
+    path: string;
     op: FilterOp;
     /** Raw string value(s) from the query string; coerced to `fieldType` at bind time. */
     values: string[];
@@ -24,7 +26,15 @@ export interface ItemFilter {
 export interface ItemSort {
     field: string;
     fieldType: FieldType;
+    /** RFC 6901 JSON pointer into the document. */
+    path: string;
     dir: "asc" | "desc";
+}
+
+/** One queryable field: its document path + type. */
+export interface ProjectionCatalogEntry {
+    path: string;
+    type: FieldType;
 }
 
 export interface CursorKey {
@@ -45,52 +55,107 @@ const OP_SQL: Record<Exclude<FilterOp, "in">, any> = {
     gte: sql`>=`,
 };
 
-/** Drizzle column holding values of the given projection type. */
-function typedColumn(fieldType: FieldType): any {
-    switch (fieldType) {
-        case "string":
-            return schemas.datasetItemFieldValues.stringValue;
+// --- jsonb-direct query helpers (replaces the EAV field_values layer) ---------
+
+/**
+ * Parse an RFC 6901 JSON pointer ("/a/b" or the shorthand "a") into path segments,
+ * unescaping `~1` -> `/` and `~0` -> `~` (in that order) so keys containing `/`
+ * or `~` resolve correctly. Mirrors DatasetWriter.getPath.
+ */
+function pathSegments(path: string): string[] {
+    return String(path)
+        .split("/")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0)
+        .map((s) => s.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+
+/** SQLite json path ($."a"."b") with embedded quotes doubled. */
+function sqliteJsonPath(segs: string[]): string {
+    return "$" + segs.map((s) => `."${s.replace(/"/g, '""')}"`).join("");
+}
+
+/** Postgres text[] path literal (ARRAY['a','b']::text[]) with bound elements. */
+function pgPathArray(segs: string[]): any {
+    return sql`ARRAY[${sql.join(segs.map((s) => sql`${s}`), sql`, `)}]::text[]`;
+}
+
+/**
+ * Typed scalar expression extracting `segs` from the document, cast for the field
+ * type so range/sort comparisons are correct in each dialect.
+ *   PG:     (document #>> '{a,b}')::<numeric|boolean|timestamptz|text>
+ *   SQLite: json_extract(document, '$.a.b')  (CAST to REAL for numbers)
+ */
+function fieldExpr(segs: string[], type: FieldType): any {
+    const col = schemas.datasetItems.document;
+    if (IS_SQLITE) {
+        const base = sql`json_extract(${col}, ${sqliteJsonPath(segs)})`;
+        // json_extract already yields native INTEGER/REAL/TEXT and 1/0 for JSON
+        // booleans; timestamps live as ISO-8601 text (lexicographically ordered).
+        return type === "number" ? sql`CAST(${base} AS REAL)` : base;
+    }
+    const extract = sql`(${col} #>> ${pgPathArray(segs)})`;
+    switch (type) {
         case "number":
-            return schemas.datasetItemFieldValues.numberValue;
+            return sql`(${extract})::numeric`;
         case "boolean":
-            return schemas.datasetItemFieldValues.booleanValue;
+            return sql`(${extract})::boolean`;
         case "timestamptz":
-            return schemas.datasetItemFieldValues.timestamptzValue;
+            return sql`(${extract})::timestamptz`;
+        default:
+            return extract; // text
     }
 }
 
-/** Coerce a raw query-string value to a driver-bindable value for its projection type. */
-function coerceFilterValue(fieldType: FieldType, raw: string): any {
-    switch (fieldType) {
-        case "string":
-            return String(raw);
+/** Render a comparison RHS literal, dialect + type aware, from a raw/scalar value. */
+function typedLiteral(type: FieldType, raw: string | number | boolean | null): any {
+    if (raw === null || raw === undefined) return sql`NULL`;
+    switch (type) {
         case "number":
-            return Number(raw);
+            return sql`${Number(raw)}`;
         case "boolean": {
-            const b = raw === "true" || raw === "1";
-            return IS_SQLITE ? (b ? 1 : 0) : b;
+            const b = raw === true || raw === 1 || raw === "true" || raw === "1";
+            return IS_SQLITE ? sql`${b ? 1 : 0}` : sql`${b}`;
         }
         case "timestamptz": {
-            const d = new Date(raw);
-            return IS_SQLITE ? d.getTime() : d;
+            const iso =
+                typeof raw === "number"
+                    ? new Date(raw).toISOString()
+                    : new Date(String(raw)).toISOString();
+            return IS_SQLITE ? sql`${iso}` : sql`${iso}::timestamptz`;
         }
+        default:
+            return sql`${String(raw)}`;
     }
 }
 
-/** Coerce a cursor's stored sort value back to a driver-bindable value. */
-function coerceCursorValue(fieldType: FieldType, v: CursorKey["v"]): any {
-    switch (fieldType) {
-        case "string":
-            return v === null ? null : String(v);
+/** jsonb_build_object value for a fast top-level eq containment (PG only). */
+function containmentValue(type: FieldType, raw: string): any {
+    switch (type) {
         case "number":
-            return v === null ? null : Number(v);
-        case "boolean": {
-            const b = v === true || v === 1 || v === "true" || v === "1";
-            return IS_SQLITE ? (b ? 1 : 0) : b;
-        }
-        case "timestamptz":
-            return v === null ? null : IS_SQLITE ? Number(v) : new Date(Number(v));
+            return sql`${Number(raw)}::numeric`;
+        case "boolean":
+            return sql`${raw === "true" || raw === "1"}::boolean`;
+        default:
+            return sql`${String(raw)}::text`;
     }
+}
+
+/** Build a single filter predicate against the document jsonb. */
+function filterCondition(f: ItemFilter): any {
+    const segs = pathSegments(f.path);
+
+    // Fast PG eq: single top-level key, non-timestamp → jsonb containment (GIN).
+    if (!IS_SQLITE && f.op === "eq" && segs.length === 1 && f.fieldType !== "timestamptz") {
+        return sql`${schemas.datasetItems.document} @> jsonb_build_object(${segs[0]}, ${containmentValue(f.fieldType, f.values[0] ?? "")})`;
+    }
+
+    const expr = fieldExpr(segs, f.fieldType);
+    if (f.op === "in") {
+        const list = f.values.map((v) => typedLiteral(f.fieldType, v));
+        return sql`${expr} IN (${sql.join(list, sql`, `)})`;
+    }
+    return sql`${expr} ${OP_SQL[f.op]} ${typedLiteral(f.fieldType, f.values[0] ?? "")}`;
 }
 
 /** Normalize a projection value read back from the DB into a compact cursor value. */
@@ -110,30 +175,19 @@ function projectionToCursorValue(fieldType: FieldType, dbVal: any): CursorKey["v
     }
 }
 
-/** EXISTS subquery correlating dataset_item_field_values to the outer dataset_items row. */
-function filterExists(f: ItemFilter): any {
-    const col = typedColumn(f.fieldType);
-    let cmp: any;
-    if (f.op === "in") {
-        const bounds = f.values.map((raw) => sql`${coerceFilterValue(f.fieldType, raw)}`);
-        cmp = sql`${col} IN (${sql.join(bounds, sql`, `)})`;
-    } else {
-        cmp = sql`${col} ${OP_SQL[f.op]} ${coerceFilterValue(f.fieldType, f.values[0] ?? "")}`;
+/** Keyset predicate for a typed jsonb sort expression with a typed bound literal. */
+function projectionKeyset(
+    expr: any,
+    uuidCol: any,
+    dir: "asc" | "desc",
+    type: FieldType,
+    cursor: CursorKey
+): any {
+    const bound = typedLiteral(type, cursor.v);
+    if (dir === "desc") {
+        return sql`(${expr} < ${bound} OR (${expr} = ${bound} AND ${uuidCol} < ${cursor.id}))`;
     }
-    return sql`EXISTS (SELECT 1 FROM ${schemas.datasetItemFieldValues}
-        WHERE ${schemas.datasetItemFieldValues.datasetId} = ${schemas.datasetItems.datasetId}
-          AND ${schemas.datasetItemFieldValues.itemKey} = ${schemas.datasetItems.itemKey}
-          AND ${schemas.datasetItemFieldValues.fieldName} = ${f.field}
-          AND ${cmp})`;
-}
-
-/** Correlated scalar subquery yielding an item's value for the sort field. */
-function sortSubquery(sort: ItemSort): any {
-    return sql`(SELECT ${typedColumn(sort.fieldType)} FROM ${schemas.datasetItemFieldValues}
-        WHERE ${schemas.datasetItemFieldValues.datasetId} = ${schemas.datasetItems.datasetId}
-          AND ${schemas.datasetItemFieldValues.itemKey} = ${schemas.datasetItems.itemKey}
-          AND ${schemas.datasetItemFieldValues.fieldName} = ${sort.field}
-        LIMIT 1)`;
+    return sql`(${expr} > ${bound} OR (${expr} = ${bound} AND ${uuidCol} > ${cursor.id}))`;
 }
 
 /**
@@ -174,6 +228,8 @@ export class Dataset {
             schemaName: string;
             schemaVersion: string;
             retentionPolicy?: { item_days?: number; change_days?: number } | null;
+            /** Queryable-field catalog snapshot: [{ field, path, type }]. */
+            queryFields?: Array<{ field: string; path: string; type: FieldType }> | null;
         }
     ): Promise<any> {
         const now = new Date();
@@ -188,12 +244,44 @@ export class Dataset {
                 sourceTemplateId: params.sourceTemplateId ?? null,
                 schemaName: params.schemaName,
                 schemaVersion: params.schemaVersion,
+                queryFields: params.queryFields ?? null,
                 retentionPolicy: params.retentionPolicy ?? null,
                 createdAt: now,
                 updatedAt: now,
             })
             .returning();
         return result[0];
+    }
+
+    /**
+     * Look up an existing non-deleted dataset for an owner by name. Owner scope
+     * precedence matches resolveDatasetOwnerScope (userId wins, else apiKeyId).
+     * Returns the oldest match (stable target for ensure-by-name accumulation), or
+     * null when unscoped or none exists. Backs DatasetWriter's ensure-by-name.
+     */
+    static async getByOwnerAndName(
+        db: DBExecutor,
+        owner: OwnerContext,
+        name: string
+    ): Promise<any | null> {
+        const scope = resolveDatasetOwnerScope(owner);
+        if (scope.by === "none") return null;
+        const conditions: any[] = [
+            sql`${schemas.datasets.deletedAt} IS NULL`,
+            eq(schemas.datasets.name, name),
+        ];
+        if (scope.by === "user") {
+            conditions.push(eq(schemas.datasets.userId, scope.value as string));
+        } else {
+            conditions.push(eq(schemas.datasets.apiKey, scope.value as string));
+        }
+        const rows = await db
+            .select()
+            .from(schemas.datasets)
+            .where(combine(conditions))
+            .orderBy(sql`${schemas.datasets.createdAt} ASC, ${schemas.datasets.uuid} ASC`)
+            .limit(1);
+        return rows[0] ?? null;
     }
 
     /** Patch mutable dataset fields (name / description / retention_policy). */
@@ -256,32 +344,39 @@ export class Dataset {
         return Dataset.finalizeTimestamp(rows, opts.limit, (r: any) => r.createdAt);
     }
 
-    /** Distinct filterable/sortable projection fields declared for a dataset. */
-    static async getProjectionFields(
+    /**
+     * The dataset's queryable-field catalog (field → { path, type }), read from the
+     * frozen `datasets.query_fields` snapshot. Used by the controller to validate
+     * filter/sort fields and to resolve each field's document path + type for the
+     * jsonb-direct query. Empty when the producer declared no projections.
+     */
+    static async getProjectionCatalog(
         db: DBExecutor,
         datasetId: string
-    ): Promise<Map<string, FieldType>> {
+    ): Promise<Map<string, ProjectionCatalogEntry>> {
         const rows = await db
-            .select({
-                fieldName: schemas.datasetItemFieldValues.fieldName,
-                fieldType: schemas.datasetItemFieldValues.fieldType,
-            })
-            .from(schemas.datasetItemFieldValues)
-            .where(eq(schemas.datasetItemFieldValues.datasetId, datasetId))
-            .groupBy(
-                schemas.datasetItemFieldValues.fieldName,
-                schemas.datasetItemFieldValues.fieldType
-            );
-        const map = new Map<string, FieldType>();
-        for (const r of rows) {
-            map.set(r.fieldName, r.fieldType as FieldType);
+            .select({ queryFields: schemas.datasets.queryFields })
+            .from(schemas.datasets)
+            .where(eq(schemas.datasets.uuid, datasetId))
+            .limit(1);
+        const map = new Map<string, ProjectionCatalogEntry>();
+        const fields = (rows[0]?.queryFields ?? []) as Array<{
+            field: string;
+            path: string;
+            type: FieldType;
+        }>;
+        for (const f of fields) {
+            if (f && typeof f.field === "string") {
+                map.set(f.field, { path: f.path, type: f.type });
+            }
         }
         return map;
     }
 
     /**
-     * Dataset items. Default order (last_seen_at DESC, uuid DESC); optional
-     * projection filters (EXISTS) and projection sort with matching keyset cursor.
+     * Dataset items. Default order (last_seen_at DESC, uuid DESC); optional filters
+     * and a sort that query the `document` jsonb directly (dialect-aware) using each
+     * field's projection path + type, with a matching keyset cursor.
      */
     static async getItems(
         db: DBExecutor,
@@ -295,15 +390,16 @@ export class Dataset {
     ): Promise<PageResult> {
         const conditions: any[] = [eq(schemas.datasetItems.datasetId, opts.datasetId)];
         for (const f of opts.filters ?? []) {
-            conditions.push(filterExists(f));
+            conditions.push(filterCondition(f));
         }
 
         if (opts.sort) {
-            const expr = sortSubquery(opts.sort);
+            const expr = fieldExpr(pathSegments(opts.sort.path), opts.sort.fieldType);
             const dir = opts.sort.dir;
             if (opts.cursor) {
-                const bound = coerceCursorValue(opts.sort.fieldType, opts.cursor.v);
-                conditions.push(exprKeyset(expr, schemas.datasetItems.uuid, dir, bound, opts.cursor.id));
+                conditions.push(
+                    projectionKeyset(expr, schemas.datasetItems.uuid, dir, opts.sort.fieldType, opts.cursor)
+                );
             }
             const dirSql = dir === "desc" ? sql`DESC` : sql`ASC`;
             const rows = await db

@@ -123,16 +123,26 @@ beforeAll(async () => {
     // The dataset tables carry FKs to parent tables (api_key, jobs, scheduled_tasks)
     // that we don't create here; disable FK enforcement for this isolated slice.
     sqlite.pragma("foreign_keys = OFF");
-    const ddl = readFileSync(
-        resolve(process.cwd(), "drizzle/SQLite/0012_dataset_core_tables.sql"),
-        "utf8"
-    );
-    for (const raw of ddl.split("--> statement-breakpoint")) {
-        const stmt = raw.trim();
-        if (stmt.length > 0) sqlite.exec(stmt);
-    }
+    // Apply the dataset core DDL, then the jsonb-query migration that drops the EAV
+    // field_values table and adds datasets.query_fields — so the test DB matches the
+    // current schema (jsonb-direct query layer + query_fields catalog snapshot).
+    applyMigrations([
+        "drizzle/SQLite/0012_dataset_core_tables.sql",
+        "drizzle/SQLite/0017_dataset_jsonb_query.sql",
+    ]);
     db = drizzle(sqlite, { schema });
 });
+
+/** Apply drizzle migration files (split on statement-breakpoint) in order. */
+function applyMigrations(files: string[]): void {
+    for (const file of files) {
+        const ddl = readFileSync(resolve(process.cwd(), file), "utf8");
+        for (const raw of ddl.split("--> statement-breakpoint")) {
+            const stmt = raw.trim();
+            if (stmt.length > 0) sqlite.exec(stmt);
+        }
+    }
+}
 
 afterAll(() => {
     sqlite?.close();
@@ -435,8 +445,7 @@ describe("DatasetWriter run membership (dataset_run_items)", () => {
     });
 });
 
-describe("DatasetWriter projections (dataset_item_field_values)", () => {
-    // Custom mapping keyed by /id so the same item_key can be re-written across jobs.
+describe("DatasetWriter query_fields catalog snapshot (replaces EAV field_values)", () => {
     const PROJ_MAPPING = {
         name: "anycrawl_scrape",
         version: "1.0.0",
@@ -448,175 +457,146 @@ describe("DatasetWriter projections (dataset_item_field_values)", () => {
         ],
     };
 
-    /** All field-value rows for an item_key, keyed by field_name. */
-    const fieldRowsOf = (datasetId: string, itemKey: string): Record<string, any> => {
-        const rows = sqlite
-            .prepare(
-                `SELECT field_name, field_type, string_value, number_value, boolean_value, timestamptz_value
-                 FROM dataset_item_field_values WHERE dataset_id = ? AND item_key = ?`
-            )
-            .all(datasetId, itemKey) as any[];
-        return Object.fromEntries(rows.map((r) => [r.field_name, r]));
+    const queryFieldsOf = (datasetId: string): any[] => {
+        const row = sqlite
+            .prepare(`SELECT query_fields FROM datasets WHERE uuid = ?`)
+            .get(datasetId) as any;
+        return row?.query_fields ? JSON.parse(row.query_fields) : [];
     };
 
-    const fieldCount = (datasetId: string): number =>
-        (sqlite
-            .prepare(`SELECT COUNT(*) AS c FROM dataset_item_field_values WHERE dataset_id = ?`)
-            .get(datasetId) as any).c;
-
-    const PUBLISHED = "2026-01-02T03:04:05.000Z";
-    const URL_P = "https://proj.test/p1";
-
-    let datasetId: string;
-
-    it("populates typed columns for each resolvable projection, one column per row", async () => {
+    it("snapshots the projection catalog onto datasets.query_fields at create", async () => {
         const out = await writeScrape({
-            jobId: "proj-1",
+            jobId: "qf-1",
             mapping: PROJ_MAPPING,
-            result: scrapeDoc(URL_P, {
+            result: scrapeDoc("https://qf.test/p1", {
                 price: { amount: 19.95 },
                 inStock: true,
                 brand: "Acme",
-                publishedAt: PUBLISHED,
+                publishedAt: "2026-01-02T03:04:05.000Z",
             }),
-            dataset: { create: { name: "Projections DS" } },
-        });
-        datasetId = out.datasetId;
-        expect(out.itemsCreated).toBe(1);
-
-        const rows = fieldRowsOf(datasetId, URL_P);
-        expect(Object.keys(rows).sort()).toEqual(["brand", "in_stock", "price", "published_at"]);
-
-        // number → number_value only.
-        expect(rows.price.field_type).toBe("number");
-        expect(rows.price.number_value).toBe(19.95);
-        expect(rows.price.string_value).toBeNull();
-        expect(rows.price.boolean_value).toBeNull();
-        expect(rows.price.timestamptz_value).toBeNull();
-
-        // boolean → boolean_value only (stored as 1 in SQLite).
-        expect(rows.in_stock.field_type).toBe("boolean");
-        expect(rows.in_stock.boolean_value).toBe(1);
-        expect(rows.in_stock.string_value).toBeNull();
-        expect(rows.in_stock.number_value).toBeNull();
-        expect(rows.in_stock.timestamptz_value).toBeNull();
-
-        // string → string_value only.
-        expect(rows.brand.field_type).toBe("string");
-        expect(rows.brand.string_value).toBe("Acme");
-        expect(rows.brand.number_value).toBeNull();
-        expect(rows.brand.boolean_value).toBeNull();
-        expect(rows.brand.timestamptz_value).toBeNull();
-
-        // timestamptz → timestamptz_value only (non-null; other typed columns null).
-        expect(rows.published_at.field_type).toBe("timestamptz");
-        expect(rows.published_at.timestamptz_value).not.toBeNull();
-        expect(rows.published_at.string_value).toBeNull();
-        expect(rows.published_at.number_value).toBeNull();
-        expect(rows.published_at.boolean_value).toBeNull();
-
-        expect(fieldCount(datasetId)).toBe(4);
-    });
-
-    it("writes no row for a projection whose path resolves to missing/null", async () => {
-        const out = await writeScrape({
-            jobId: "proj-missing",
-            mapping: PROJ_MAPPING,
-            result: scrapeDoc("https://proj.test/missing", {
-                price: { amount: 5 },
-                // inStock, brand, publishedAt all absent.
-            }),
-            dataset: { datasetId },
+            dataset: { create: { name: "QueryFields DS" } },
         });
         expect(out.itemsCreated).toBe(1);
 
-        const rows = fieldRowsOf(datasetId, "https://proj.test/missing");
-        // Only the resolvable projection produced a row.
-        expect(Object.keys(rows)).toEqual(["price"]);
-        expect(rows.price.number_value).toBe(5);
+        const fields = queryFieldsOf(out.datasetId);
+        expect(fields).toEqual([
+            { field: "price", path: "/price/amount", type: "number" },
+            { field: "in_stock", path: "/inStock", type: "boolean" },
+            { field: "brand", path: "/brand", type: "string" },
+            { field: "published_at", path: "/publishedAt", type: "timestamptz" },
+        ]);
+
+        // No per-item projection rows are written anymore (document is the sole store).
+        const hasFieldValuesTable = sqlite
+            .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='dataset_item_field_values'`)
+            .get();
+        expect(hasFieldValuesTable).toBeUndefined();
     });
 
-    it("upserts on the update path: one row per field, values refreshed, no duplicates", async () => {
-        const before = fieldRowsOf(datasetId, URL_P);
-        // Change a projected field (price) via a different job → item is 'updated'.
+    it("leaves query_fields null when the mapping declares no projections", async () => {
         const out = await writeScrape({
-            jobId: "proj-2",
-            mapping: PROJ_MAPPING,
-            result: scrapeDoc(URL_P, {
-                price: { amount: 29.5 },
-                inStock: false,
-                brand: "Acme",
-                publishedAt: PUBLISHED,
-            }),
-            dataset: { datasetId },
-        });
-        expect(out.itemsUpdated).toBe(1);
-
-        const after = fieldRowsOf(datasetId, URL_P);
-        // Still exactly four rows for this item (upsert, not insert).
-        expect(Object.keys(after).sort()).toEqual(["brand", "in_stock", "price", "published_at"]);
-        // Same physical rows were updated in place, refreshed values.
-        expect(after.price.number_value).toBe(29.5);
-        expect(after.in_stock.boolean_value).toBe(0); // false now
-        // No new rows created overall for this item beyond the original four.
-        expect(Object.keys(after)).toHaveLength(Object.keys(before).length);
-    });
-
-    it("is idempotent on replay: replaying the same job leaves field_values unchanged", async () => {
-        const countBefore = fieldCount(datasetId);
-        const rowsBefore = fieldRowsOf(datasetId, URL_P);
-
-        await writeScrape({
-            jobId: "proj-2", // same producer message as the update above
-            mapping: PROJ_MAPPING,
-            result: scrapeDoc(URL_P, {
-                price: { amount: 29.5 },
-                inStock: false,
-                brand: "Acme",
-                publishedAt: PUBLISHED,
-            }),
-            dataset: { datasetId },
-        });
-
-        expect(fieldCount(datasetId)).toBe(countBefore);
-        const rowsAfter = fieldRowsOf(datasetId, URL_P);
-        expect(rowsAfter.price.number_value).toBe(rowsBefore.price.number_value);
-        expect(rowsAfter.in_stock.boolean_value).toBe(rowsBefore.in_stock.boolean_value);
-    });
-
-    it("writes no field_values when the mapping declares no projections", async () => {
-        const out = await writeScrape({
-            jobId: "no-proj-1",
+            jobId: "qf-none",
             mapping: SCRAPE_MAPPING, // no projections
-            result: scrapeDoc("https://noproj.test/a", { price: { amount: 1 } }),
-            dataset: { create: { name: "No Projections DS" } },
+            result: scrapeDoc("https://qf.test/none", { price: { amount: 1 } }),
+            dataset: { create: { name: "No QueryFields DS" } },
         });
         expect(out.itemsCreated).toBe(1);
-        expect(fieldCount(out.datasetId)).toBe(0);
+        expect(queryFieldsOf(out.datasetId)).toEqual([]);
+    });
+});
+
+describe("DatasetWriter ensure-by-name accumulation", () => {
+    const datasetsNamed = (name: string): any[] =>
+        sqlite
+            .prepare(`SELECT uuid, item_count FROM datasets WHERE name = ? AND deleted_at IS NULL`)
+            .all(name) as any[];
+
+    it("reuses one dataset for repeated create-by-name runs (same owner) and accumulates items", async () => {
+        const NAME = "Accumulate DS";
+
+        const first = await writeScrape({
+            jobId: "acc-1",
+            result: scrapeDoc("https://acc.test/1"),
+            dataset: { create: { name: NAME } },
+        });
+        const second = await writeScrape({
+            jobId: "acc-2",
+            result: scrapeDoc("https://acc.test/2"),
+            dataset: { create: { name: NAME } },
+        });
+
+        // Both runs resolved to the SAME dataset.
+        expect(second.datasetId).toBe(first.datasetId);
+        expect(datasetsNamed(NAME)).toHaveLength(1);
+
+        // Items from both runs accumulated into it (2 distinct URLs → 2 items).
+        expect(first.itemsCreated).toBe(1);
+        expect(second.itemsCreated).toBe(1);
+        const ds = datasetsNamed(NAME)[0];
+        expect(ds.item_count).toBe(2);
+
+        // Two runs recorded against the one dataset (per-producer runs still distinct).
+        expect(countRows("dataset_runs")).toBeGreaterThanOrEqual(2);
     });
 
-    it("resolves RFC 6901 escaped tokens (~1 -> '/', ~0 -> '~') in projection paths", async () => {
-        const out = await writeScrape({
-            jobId: "proj-esc",
-            mapping: {
-                name: "anycrawl_scrape",
-                version: "1.0.0",
-                projections: [
-                    { name: "slash_field", path: "/a~1b", type: "string" },
-                    { name: "tilde_field", path: "/c~0d", type: "string" },
-                ],
-            },
-            result: scrapeDoc("https://proj.test/escapes", {
-                "a/b": "slash-value",
-                "c~d": "tilde-value",
-            }),
-            dataset: { create: { name: "Escape DS" } },
-        });
-        expect(out.itemsCreated).toBe(1);
+    it("dedups + change-tracks an identical then changed item across ensure-by-name runs", async () => {
+        const NAME = "Accumulate Dedup DS";
+        const URL = "https://acc-dedup.test/x";
 
-        const rows = fieldRowsOf(out.datasetId, "https://proj.test/escapes");
-        expect(rows.slash_field.string_value).toBe("slash-value");
-        expect(rows.tilde_field.string_value).toBe("tilde-value");
+        const r1 = await writeScrape({ jobId: "ad-1", result: scrapeDoc(URL), dataset: { create: { name: NAME } } });
+        // Same content, different job → reuse dataset, item unchanged (dedup by hash).
+        const r2 = await writeScrape({ jobId: "ad-2", result: scrapeDoc(URL), dataset: { create: { name: NAME } } });
+        // Changed content → reuse dataset, item updated (change tracked).
+        const r3 = await writeScrape({
+            jobId: "ad-3",
+            result: scrapeDoc(URL, { title: "Changed" }),
+            dataset: { create: { name: NAME } },
+        });
+
+        expect(r2.datasetId).toBe(r1.datasetId);
+        expect(r3.datasetId).toBe(r1.datasetId);
+        expect(r1.itemsCreated).toBe(1);
+        expect(r2.itemsUnchanged).toBe(1);
+        expect(r3.itemsUpdated).toBe(1);
+
+        // One dataset, one item, one created + one updated change row.
+        expect(datasetsNamed(NAME)).toHaveLength(1);
+        const ds = datasetsNamed(NAME)[0];
+        expect(ds.item_count).toBe(1);
+    });
+
+    it("does not merge same-name datasets across different owners", async () => {
+        const NAME = "Owner Scoped DS";
+        const A = await DatasetWriter.writeResultToDataset({
+            producerType: "scrape",
+            producerId: "own-a",
+            jobId: "own-a",
+            scope: { kind: "job", jobId: "own-a" },
+            scopeType: "scrape",
+            result: scrapeDoc("https://own.test/a"),
+            mapping: SCRAPE_MAPPING,
+            owner: { userId: "owner-A" },
+            dataset: { create: { name: NAME } },
+            dbOrTx: db,
+            now: new Date(),
+        });
+        const B = await DatasetWriter.writeResultToDataset({
+            producerType: "scrape",
+            producerId: "own-b",
+            jobId: "own-b",
+            scope: { kind: "job", jobId: "own-b" },
+            scopeType: "scrape",
+            result: scrapeDoc("https://own.test/b"),
+            mapping: SCRAPE_MAPPING,
+            owner: { userId: "owner-B" },
+            dataset: { create: { name: NAME } },
+            dbOrTx: db,
+            now: new Date(),
+        });
+
+        // Distinct owners → distinct datasets even with an identical name.
+        expect(B.datasetId).not.toBe(A.datasetId);
+        expect(datasetsNamed(NAME)).toHaveLength(2);
     });
 });
 

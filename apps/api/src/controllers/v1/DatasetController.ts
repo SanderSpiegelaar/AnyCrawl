@@ -17,7 +17,6 @@ import {
     listRunWarnings,
     type DatasetItemFilter,
     type DatasetItemSort,
-    type DatasetFieldType,
     type DatasetPageResult,
 } from "@anycrawl/db";
 import { serializeRecord, serializeRecords } from "../../utils/serializer.js";
@@ -180,12 +179,18 @@ export class DatasetController {
             const cursor = this.parseCursor(req, res);
             if (cursor === false) return;
 
+            // Queryable-field catalog: field → { path, type }, read from the dataset's
+            // frozen query_fields snapshot. Filter/sort fields are validated against it
+            // (unknown field → 400); the resolved path + type drive the jsonb query.
+            // NOTE: ad-hoc querying of undeclared document fields is out of scope — the
+            // declared-field whitelist below could become an opt-in toggle later.
             const projection = await getDatasetProjectionFields(db, req.params.id!);
 
             // Filters
             const filters: DatasetItemFilter[] = [];
             for (const raw of this.extractRawFilters(req.query)) {
-                if (!projection.has(raw.field)) {
+                const entry = projection.get(raw.field);
+                if (!entry) {
                     this.badRequest(res, "invalid_filter", `Unknown filter field: ${raw.field}`);
                     return;
                 }
@@ -193,12 +198,17 @@ export class DatasetController {
                     this.badRequest(res, "invalid_filter", `Unknown filter operator: ${raw.op}`);
                     return;
                 }
-                const fieldType = projection.get(raw.field) as DatasetFieldType;
                 const values =
                     raw.op === "in"
                         ? raw.value.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
                         : [raw.value];
-                filters.push({ field: raw.field, fieldType, op: raw.op as DatasetItemFilter["op"], values });
+                filters.push({
+                    field: raw.field,
+                    fieldType: entry.type,
+                    path: entry.path,
+                    op: raw.op as DatasetItemFilter["op"],
+                    values,
+                });
             }
 
             // Sort
@@ -207,11 +217,12 @@ export class DatasetController {
                 const rawSort = String(req.query.sort);
                 const dir = rawSort.startsWith("-") ? "desc" : "asc";
                 const field = rawSort.replace(/^-/, "");
-                if (!projection.has(field)) {
+                const entry = projection.get(field);
+                if (!entry) {
                     this.badRequest(res, "invalid_sort", `Unknown sort field: ${field}`);
                     return;
                 }
-                sort = { field, fieldType: projection.get(field) as DatasetFieldType, dir };
+                sort = { field, fieldType: entry.type, path: entry.path, dir };
             }
 
             const page = await getDatasetItems(db, {

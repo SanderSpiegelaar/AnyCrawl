@@ -514,7 +514,9 @@ export const monitorChanges = p.pgTable("monitor_changes", {
 // ============================================================================
 // Dataset (L2) tables — platform §11 / dedicated §5.9.
 // MVP tables: datasets, dataset_runs, dataset_items, dataset_item_changes.
-// FULL-only tables: dataset_run_items, dataset_item_scopes, dataset_item_field_values, run_warnings.
+// FULL-only tables: dataset_run_items, dataset_item_scopes, run_warnings.
+// Filter/sort query the dataset_items.document jsonb directly (GIN index); the
+// queryable-field catalog is snapshotted onto datasets.query_fields at create.
 // MVP -> full is pure add-table/add-column/add-constraint (R2 forward-compat, no renames).
 // ============================================================================
 
@@ -529,6 +531,14 @@ export const datasets = p.pgTable("datasets", {
     sourceTemplateRevisionUuid: p.uuid("source_template_revision_uuid"),          // [RESERVED per R2] FK -> template_revisions in L3
     schemaName: p.text("schema_name").notNull(),
     schemaVersion: p.text("schema_version").notNull(),
+    // Frozen queryable-field catalog for jsonb-direct filter/sort (replaces the EAV
+    // dataset_item_field_values table). Snapshotted at dataset create from the
+    // producer mapping's projections: [{ field, path (RFC 6901), type }]. Read at
+    // query time to validate filter/sort fields and resolve each field's document
+    // path + type. Null/empty when the producer declares no projections.
+    queryFields: p
+        .jsonb("query_fields")
+        .$type<Array<{ field: string; path: string; type: "string" | "number" | "boolean" | "timestamptz" }>>(),
     retentionPolicy: p.jsonb("retention_policy").$type<{ item_days?: number; change_days?: number }>(),
     itemCount: p.integer("item_count").notNull().default(0),
     activeItemCount: p.integer("active_item_count").notNull().default(0),
@@ -538,6 +548,11 @@ export const datasets = p.pgTable("datasets", {
 }, (t) => [
     p.index("ix_datasets_user_created").on(t.userId, t.createdAt, t.uuid).where(sql`${t.deletedAt} IS NULL`),
     p.index("ix_datasets_apikey_created").on(t.apiKey, t.createdAt, t.uuid).where(sql`${t.deletedAt} IS NULL`),
+    // Ensure-by-name lookup indexes (owner + name, non-deleted). Non-unique on
+    // purpose: model-level ensure-by-name enforces single-dataset-per-name without
+    // a hard unique constraint that could fail on pre-existing duplicates.
+    p.index("ix_datasets_user_name").on(t.userId, t.name).where(sql`${t.deletedAt} IS NULL`),
+    p.index("ix_datasets_apikey_name").on(t.apiKey, t.name).where(sql`${t.deletedAt} IS NULL`),
 ]);
 
 export const datasetRuns = p.pgTable("dataset_runs", {
@@ -586,6 +601,10 @@ export const datasetItems = p.pgTable("dataset_items", {
 }, (t) => [
     p.uniqueIndex("uq_dataset_item").on(t.datasetId, t.itemKey),
     p.index("ix_dataset_item_cursor").on(t.datasetId, t.lastSeenAt, t.uuid),
+    // GIN index over the document for fast jsonb containment (@>) — powers the
+    // fast eq filter path (document @> jsonb_build_object(key, val)). jsonb_path_ops
+    // is smaller/faster and sufficient since we only use containment, never key-exists.
+    p.index("ix_dataset_item_document_gin").using("gin", t.document.op("jsonb_path_ops")),
 ]);
 
 export const datasetRunItems = p.pgTable("dataset_run_items", {
@@ -640,32 +659,6 @@ export const datasetItemChanges = p.pgTable("dataset_item_changes", {
     p.index("ix_dataset_change_run_cursor").on(t.datasetRunId, t.createdAt, t.uuid),
     p.index("ix_dataset_change_dataset_cursor").on(t.datasetId, t.createdAt, t.uuid),
     p.index("ix_dataset_change_item").on(t.datasetItemId),
-]);
-
-export const datasetItemFieldValues = p.pgTable("dataset_item_field_values", {
-    uuid: p.uuid().primaryKey().$defaultFn(() => randomUUID()),
-    datasetId: p.uuid("dataset_id").notNull().references(() => datasets.uuid, { onDelete: "cascade" }),
-    itemKey: p.text("item_key").notNull(),
-    fieldName: p.text("field_name").notNull(),
-    fieldType: p.text("field_type").notNull(),
-    stringValue: p.text("string_value"),
-    numberValue: p.numeric("number_value"),
-    booleanValue: p.boolean("boolean_value"),
-    timestamptzValue: p.timestamp("timestamptz_value", { withTimezone: true }),
-    createdAt: p.timestamp("created_at", { withTimezone: true }).notNull(),
-    updatedAt: p.timestamp("updated_at", { withTimezone: true }).notNull(),
-}, (t) => [
-    p.uniqueIndex("uq_dataset_item_field").on(t.datasetId, t.itemKey, t.fieldName),
-    p.check("dataset_item_field_values_typed_value_chk", sql`
-        (${t.fieldType} = 'string'      AND ${t.stringValue}      IS NOT NULL AND ${t.numberValue} IS NULL AND ${t.booleanValue} IS NULL AND ${t.timestamptzValue} IS NULL)
-     OR (${t.fieldType} = 'number'      AND ${t.numberValue}      IS NOT NULL AND ${t.stringValue} IS NULL AND ${t.booleanValue} IS NULL AND ${t.timestamptzValue} IS NULL)
-     OR (${t.fieldType} = 'boolean'     AND ${t.booleanValue}     IS NOT NULL AND ${t.stringValue} IS NULL AND ${t.numberValue} IS NULL AND ${t.timestamptzValue} IS NULL)
-     OR (${t.fieldType} = 'timestamptz' AND ${t.timestamptzValue} IS NOT NULL AND ${t.stringValue} IS NULL AND ${t.numberValue} IS NULL AND ${t.booleanValue} IS NULL)
-    `),
-    p.index("ix_dsfv_string").on(t.datasetId, t.fieldName, t.stringValue),
-    p.index("ix_dsfv_number").on(t.datasetId, t.fieldName, t.numberValue),
-    p.index("ix_dsfv_boolean").on(t.datasetId, t.fieldName, t.booleanValue),
-    p.index("ix_dsfv_timestamptz").on(t.datasetId, t.fieldName, t.timestamptzValue),
 ]);
 
 export const runWarnings = p.pgTable("run_warnings", {

@@ -31,11 +31,23 @@ let listDatasetRuns: any;
 let listDatasetChanges: any;
 let listDatasetsByOwner: any;
 let listRunWarnings: any;
+let getDatasetProjectionFields: any;
 // Bound export used only to seed rows (safe — index.ts binds the writer).
 let writeResultToDataset: any;
 
 let sqlite: any;
 let db: any;
+
+/** Apply drizzle migration files (split on statement-breakpoint) in order. */
+function applyMigrations(files: string[]): void {
+    for (const file of files) {
+        const ddl = readFileSync(resolve(process.cwd(), file), "utf8");
+        for (const raw of ddl.split("--> statement-breakpoint")) {
+            const stmt = raw.trim();
+            if (stmt.length > 0) sqlite.exec(stmt);
+        }
+    }
+}
 
 const OWNER = { userId: "user-1" };
 const SEARCH_MAPPING = { name: "anycrawl_search_result", version: "1.0.0" };
@@ -69,20 +81,24 @@ beforeAll(async () => {
     const schema = await import("../db/schemas/SQLite.js");
     // Import the real package barrel so we exercise the *bare* export wiring itself.
     const dbPkg: any = await import("../index.js");
-    ({ getDatasetItems, listDatasetRuns, listDatasetChanges, listDatasetsByOwner, listRunWarnings, writeResultToDataset } =
-        dbPkg);
+    ({
+        getDatasetItems,
+        listDatasetRuns,
+        listDatasetChanges,
+        listDatasetsByOwner,
+        listRunWarnings,
+        getDatasetProjectionFields,
+        writeResultToDataset,
+    } = dbPkg);
 
     sqlite = new Database(":memory:");
     // Dataset tables carry FKs to parent tables (api_key, jobs, ...) we don't create here.
     sqlite.pragma("foreign_keys = OFF");
-    const ddl = readFileSync(
-        resolve(process.cwd(), "drizzle/SQLite/0012_dataset_core_tables.sql"),
-        "utf8"
-    );
-    for (const raw of ddl.split("--> statement-breakpoint")) {
-        const stmt = raw.trim();
-        if (stmt.length > 0) sqlite.exec(stmt);
-    }
+    // Core DDL then the jsonb-query migration (drops EAV field_values, adds query_fields).
+    applyMigrations([
+        "drizzle/SQLite/0012_dataset_core_tables.sql",
+        "drizzle/SQLite/0017_dataset_jsonb_query.sql",
+    ]);
     db = drizzle(sqlite, { schema });
 });
 
@@ -169,5 +185,138 @@ describe("Dataset read bare exports keep their `this` binding (regression: this.
         });
         expect(page.items).toEqual([]);
         expect(page.nextCursor).toBeNull();
+    });
+});
+
+/**
+ * jsonb-direct filter/sort query layer (replaces the EAV field_values queries).
+ * Seeds items with structured documents via a projections mapping (which snapshots
+ * the query_fields catalog) and asserts filter[field][op] + sort resolve the right
+ * rows through json_extract on the document.
+ */
+describe("Dataset.getItems jsonb filter/sort (json_extract via query_fields catalog)", () => {
+    // DatasetMapping projections use `name` (the query-facing field). The writer
+    // snapshots them onto datasets.query_fields as { field: name, path, type }.
+    const PROJ_SEARCH_MAPPING = {
+        name: "anycrawl_search_result",
+        version: "1.0.0",
+        projections: [
+            { name: "price", path: "/price", type: "number" },
+            { name: "brand", path: "/brand", type: "string" },
+            { name: "in_stock", path: "/inStock", type: "boolean" },
+            { name: "published_at", path: "/publishedAt", type: "timestamptz" },
+        ],
+    };
+
+    let datasetId: string;
+    let catalog: Map<string, { path: string; type: string }>;
+
+    const KEY = (n: number) => `https://query.test/${n}`;
+    const keysOf = (page: any): string[] => page.items.map((i: any) => i.itemKey);
+
+    /** Build an ItemFilter from the catalog (mirrors the controller). */
+    const filter = (field: string, op: string, ...values: string[]) => {
+        const entry = catalog.get(field)!;
+        return { field, fieldType: entry.type as any, path: entry.path, op: op as any, values };
+    };
+    const sortBy = (field: string, dir: "asc" | "desc") => {
+        const entry = catalog.get(field)!;
+        return { field, fieldType: entry.type as any, path: entry.path, dir };
+    };
+
+    beforeAll(async () => {
+        await writeResultToDataset({
+            producerType: "search",
+            producerId: "query-seed",
+            jobId: "query-seed",
+            scope: { kind: "job", jobId: "query-seed" },
+            scopeType: "search",
+            result: [
+                { url: KEY(1), price: 10, brand: "Acme", inStock: true, publishedAt: "2026-01-01T00:00:00.000Z" },
+                { url: KEY(2), price: 20, brand: "Beta", inStock: false, publishedAt: "2026-02-01T00:00:00.000Z" },
+                { url: KEY(3), price: 30, brand: "Acme", inStock: true, publishedAt: "2026-03-01T00:00:00.000Z" },
+            ],
+            mapping: PROJ_SEARCH_MAPPING,
+            owner: OWNER,
+            dataset: { create: { name: "Query DS" } },
+            dbOrTx: db,
+            now: new Date(),
+        });
+        // Resolve the dataset id from the freshly-created "Query DS".
+        const row = sqlite.prepare(`SELECT uuid FROM datasets WHERE name = 'Query DS'`).get() as any;
+        datasetId = row.uuid;
+        catalog = await getDatasetProjectionFields(db, datasetId);
+    });
+
+    it("exposes the query_fields catalog with field → { path, type }", () => {
+        expect(catalog.get("price")).toEqual({ path: "/price", type: "number" });
+        expect(catalog.get("brand")).toEqual({ path: "/brand", type: "string" });
+        expect(catalog.get("in_stock")).toEqual({ path: "/inStock", type: "boolean" });
+        expect(catalog.get("published_at")).toEqual({ path: "/publishedAt", type: "timestamptz" });
+    });
+
+    it("filters numeric eq", async () => {
+        const page = await getDatasetItems(db, { datasetId, limit: 50, filters: [filter("price", "eq", "20")] });
+        expect(keysOf(page)).toEqual([KEY(2)]);
+    });
+
+    it("filters numeric range (gt / lte)", async () => {
+        const gt = await getDatasetItems(db, { datasetId, limit: 50, filters: [filter("price", "gt", "15")] });
+        expect(keysOf(gt).sort()).toEqual([KEY(2), KEY(3)]);
+        const lte = await getDatasetItems(db, { datasetId, limit: 50, filters: [filter("price", "lte", "20")] });
+        expect(keysOf(lte).sort()).toEqual([KEY(1), KEY(2)]);
+    });
+
+    it("filters string eq and in", async () => {
+        const eq = await getDatasetItems(db, { datasetId, limit: 50, filters: [filter("brand", "eq", "Acme")] });
+        expect(keysOf(eq).sort()).toEqual([KEY(1), KEY(3)]);
+        const inList = await getDatasetItems(db, { datasetId, limit: 50, filters: [filter("brand", "in", "Beta", "Acme")] });
+        expect(keysOf(inList).sort()).toEqual([KEY(1), KEY(2), KEY(3)]);
+    });
+
+    it("filters boolean eq", async () => {
+        const t = await getDatasetItems(db, { datasetId, limit: 50, filters: [filter("in_stock", "eq", "true")] });
+        expect(keysOf(t).sort()).toEqual([KEY(1), KEY(3)]);
+        const f = await getDatasetItems(db, { datasetId, limit: 50, filters: [filter("in_stock", "eq", "false")] });
+        expect(keysOf(f)).toEqual([KEY(2)]);
+    });
+
+    it("filters timestamptz range", async () => {
+        const page = await getDatasetItems(db, {
+            datasetId,
+            limit: 50,
+            filters: [filter("published_at", "gt", "2026-01-15T00:00:00.000Z")],
+        });
+        expect(keysOf(page).sort()).toEqual([KEY(2), KEY(3)]);
+    });
+
+    it("combines multiple filters (AND)", async () => {
+        const page = await getDatasetItems(db, {
+            datasetId,
+            limit: 50,
+            filters: [filter("brand", "eq", "Acme"), filter("price", "gt", "15")],
+        });
+        expect(keysOf(page)).toEqual([KEY(3)]);
+    });
+
+    it("sorts by a numeric projection asc/desc with a stable uuid tiebreaker", async () => {
+        const asc = await getDatasetItems(db, { datasetId, limit: 50, sort: sortBy("price", "asc") });
+        expect(keysOf(asc)).toEqual([KEY(1), KEY(2), KEY(3)]);
+        const desc = await getDatasetItems(db, { datasetId, limit: 50, sort: sortBy("price", "desc") });
+        expect(keysOf(desc)).toEqual([KEY(3), KEY(2), KEY(1)]);
+    });
+
+    it("paginates a projection sort via the keyset cursor", async () => {
+        const p1 = await getDatasetItems(db, { datasetId, limit: 2, sort: sortBy("price", "asc") });
+        expect(keysOf(p1)).toEqual([KEY(1), KEY(2)]);
+        expect(p1.nextCursor).not.toBeNull();
+        const p2 = await getDatasetItems(db, {
+            datasetId,
+            limit: 2,
+            sort: sortBy("price", "asc"),
+            cursor: p1.nextCursor,
+        });
+        expect(keysOf(p2)).toEqual([KEY(3)]);
+        expect(p2.nextCursor).toBeNull();
     });
 });
