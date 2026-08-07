@@ -253,7 +253,7 @@ export class Dataset {
             .orderBy(sql`${schemas.datasets.createdAt} DESC, ${schemas.datasets.uuid} DESC`)
             .limit(opts.limit + 1);
 
-        return this.finalizeTimestamp(rows, opts.limit, (r: any) => r.createdAt);
+        return Dataset.finalizeTimestamp(rows, opts.limit, (r: any) => r.createdAt);
     }
 
     /** Distinct filterable/sortable projection fields declared for a dataset. */
@@ -334,7 +334,7 @@ export class Dataset {
             .orderBy(sql`${schemas.datasetItems.lastSeenAt} DESC, ${schemas.datasetItems.uuid} DESC`)
             .limit(opts.limit + 1);
 
-        return this.finalizeTimestamp(rows, opts.limit, (r: any) => r.lastSeenAt);
+        return Dataset.finalizeTimestamp(rows, opts.limit, (r: any) => r.lastSeenAt);
     }
 
     /** Dataset runs, cursor on (created_at DESC, uuid DESC). */
@@ -356,7 +356,7 @@ export class Dataset {
             .orderBy(sql`${schemas.datasetRuns.createdAt} DESC, ${schemas.datasetRuns.uuid} DESC`)
             .limit(opts.limit + 1);
 
-        return this.finalizeTimestamp(rows, opts.limit, (r: any) => r.createdAt);
+        return Dataset.finalizeTimestamp(rows, opts.limit, (r: any) => r.createdAt);
     }
 
     /** A single run scoped to its parent dataset. Null when not found / mismatched. */
@@ -437,7 +437,7 @@ export class Dataset {
             .orderBy(sql`${schemas.datasetItemChanges.createdAt} DESC, ${schemas.datasetItemChanges.uuid} DESC`)
             .limit(opts.limit + 1);
 
-        return this.finalizeTimestamp(rows, opts.limit, (r: any) => r.createdAt);
+        return Dataset.finalizeTimestamp(rows, opts.limit, (r: any) => r.createdAt);
     }
 
     /** Run warnings, filterable by code/scope/item_key, cursor on (created_at DESC, uuid DESC). */
@@ -468,7 +468,7 @@ export class Dataset {
             .orderBy(sql`${schemas.runWarnings.createdAt} DESC, ${schemas.runWarnings.uuid} DESC`)
             .limit(opts.limit + 1);
 
-        return this.finalizeTimestamp(rows, opts.limit, (r: any) => r.createdAt);
+        return Dataset.finalizeTimestamp(rows, opts.limit, (r: any) => r.createdAt);
     }
 
     /** Trim a limit+1 fetch and derive the next timestamp cursor from the last row. */

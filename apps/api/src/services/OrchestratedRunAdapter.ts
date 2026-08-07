@@ -139,9 +139,11 @@ export class OrchestratedRunAdapter {
 
             // 6) Record dispatch + move the run to running (mirror startCrawlRun).
             await appendTemplateRunEvent(run.uuid, "run_dispatched", { mode: "orchestrated" });
+            // NB: do NOT set legacyJobUuid here — the template-run BullMQ job is not a
+            // `jobs` row (legacy_job_uuid FKs to jobs). The BullMQ jobId == run.uuid
+            // (stable), so it's recoverable; orchestrated status is driven by the worker's finalize.
             await updateTemplateRunStatus(run.uuid, {
                 status: "running",
-                legacyJobUuid: bullJobId,
                 datasetId: existingDatasetId ?? undefined,
                 startedAt: new Date(),
             });

@@ -210,10 +210,13 @@ describe("TemplateRunController.create", () => {
         expect(payload.dataset.create.name).toBe("craigslist_listing");
 
         // Run is moved to running and the response is 202.
-        expect(updateTemplateRunStatus).toHaveBeenCalledWith(
-            "run-uuid-1",
-            expect.objectContaining({ status: "running", legacyJobUuid: "bull-job-1" })
+        // NOTE: orchestrated runs must NOT set legacyJobUuid — the template-run BullMQ job
+        // is not a `jobs` row (legacy_job_uuid FKs to jobs). The BullMQ jobId == run.uuid.
+        const statusCall = (updateTemplateRunStatus as jest.Mock).mock.calls.find(
+            (c: any[]) => c[0] === "run-uuid-1" && c[1]?.status === "running"
         );
+        expect(statusCall).toBeTruthy();
+        expect(statusCall![1].legacyJobUuid).toBeUndefined();
         expect(res.statusCode).toBe(202);
         expect(res.body.success).toBe(true);
         expect(res.body.data.status).toBe("running");
