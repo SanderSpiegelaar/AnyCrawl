@@ -1,8 +1,4 @@
-name: anycrawl-pg
-
 x-common-service: &common-service
-  networks:
-    - anycrawl-network
   volumes:
     - anycrawl-storage:/usr/src/app/storage
 
@@ -33,17 +29,15 @@ x-common-env: &common-env
   ALLOW_LOCAL_WEBHOOKS: ${ALLOW_LOCAL_WEBHOOKS:-false}
 
 services:
-  api:
+  anycrawl-api:
     <<: *common-service
     image: ghcr.io/any4ai/anycrawl-api:latest
     environment:
       <<: *common-env
-    ports:
-      - "${ANYCRAWL_API_PORT:-8080}:8080"
     depends_on:
-      postgres:
+      anycrawl-postgres:
         condition: service_healthy
-      redis:
+      anycrawl-redis:
         condition: service_healthy
     restart: unless-stopped
 
@@ -54,9 +48,9 @@ services:
       <<: *common-env
       ANYCRAWL_CRAWLEE_STORAGE_DIR: /tmp/anycrawl-crawlee-storage/playwright
     depends_on:
-      postgres:
+      anycrawl-postgres:
         condition: service_healthy
-      redis:
+      anycrawl-redis:
         condition: service_healthy
     restart: unless-stopped
 
@@ -67,9 +61,9 @@ services:
       <<: *common-env
       ANYCRAWL_CRAWLEE_STORAGE_DIR: /tmp/anycrawl-crawlee-storage/cheerio
     depends_on:
-      postgres:
+      anycrawl-postgres:
         condition: service_healthy
-      redis:
+      anycrawl-redis:
         condition: service_healthy
     restart: unless-stopped
 
@@ -82,19 +76,17 @@ services:
       <<: *common-env
       ANYCRAWL_CRAWLEE_STORAGE_DIR: /tmp/anycrawl-crawlee-storage/puppeteer
     depends_on:
-      postgres:
+      anycrawl-postgres:
         condition: service_healthy
-      redis:
+      anycrawl-redis:
         condition: service_healthy
     restart: unless-stopped
 
-  redis:
+  anycrawl-redis:
     image: redis:7-alpine
     command: redis-server --appendonly yes
     volumes:
       - redis-data:/data
-    networks:
-      - anycrawl-network
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -102,16 +94,14 @@ services:
       retries: 5
     restart: unless-stopped
 
-  postgres:
-    image: postgres:16-alpine
+  anycrawl-postgres:
+    image: postgres:17
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-anycrawl}
       POSTGRES_USER: ${POSTGRES_USER:-anycrawl}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-anycrawl}
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    networks:
-      - anycrawl-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
@@ -123,7 +113,3 @@ volumes:
   anycrawl-storage:
   redis-data:
   postgres-data:
-
-networks:
-  anycrawl-network:
-    driver: bridge
